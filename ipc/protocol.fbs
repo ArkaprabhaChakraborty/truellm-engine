@@ -1,0 +1,210 @@
+// ---------------------------------------------------------------------------
+// protocol.fbs — TrueLLM Plugin IPC Protocol v1
+//
+// Ground truth for all messages exchanged between the C++ engine and the
+// Python / JavaScript sidecar processes.
+//
+// Generate C++ bindings:
+//   flatc --cpp --gen-object-api -o ipc/generated/ ipc/protocol.fbs
+//
+// Generate Python bindings:
+//   flatc --python -o truellm-plugin-engine/truellm_engine/protocol/ ipc/protocol.fbs
+// ---------------------------------------------------------------------------
+
+namespace truellm.ipc;
+
+// ── Shared types ──────────────────────────────────────────────────────────────
+
+/// Mirrors truellm_error_t from plugin.h
+enum ErrorCode : byte {
+    Ok          = 0,
+    Invalid     = 1,
+    NotFound    = 2,
+    Internal    = 3,
+    Timeout     = 4,
+    Permission  = 5,
+    Abort       = 6,
+}
+
+/// Preprocessor chain decision
+enum PreprocDecision : byte {
+    Pass    = 0,
+    Respond = 1,
+    Abort   = 2,
+}
+
+// ── Tool schema (sent in PluginAnnounce) ──────────────────────────────────────
+
+table ToolDef {
+    qualified_name: string;   // "<plugin_id>.<tool_name>"
+    schema_json:    string;   // Full OpenAI tool object JSON
+}
+
+// ── Plugin announce ───────────────────────────────────────────────────────────
+// Sent by sidecar → engine when the sidecar is ready.
+// Carries the complete tool schema list for all loaded plugins.
+
+table PluginInfo {
+    plugin_id:      string;
+    plugin_version: string;
+    runtime:        string;    // "python" | "js"
+    hooks:          [string];  // ["tool_provider", "preprocessor", ...]
+    tool_defs:      [ToolDef];
+}
+
+table PluginAnnounce {
+    protocol_version: uint32 = 1;
+    plugins:          [PluginInfo];
+}
+
+// ── Plugin events ─────────────────────────────────────────────────────────────
+
+enum PluginEventType : byte {
+    Register   = 0,
+    Unregister = 1,
+    Enable     = 2,
+    Disable    = 3,
+    Reload     = 4,
+}
+
+table PluginEvent {
+    event_type: PluginEventType;
+    plugin_id:  string;
+    info:       PluginInfo;  // present for Register
+}
+
+// ── Tool call / result ────────────────────────────────────────────────────────
+
+table ToolCall {
+    correlation_id:  uint64;
+    qualified_name:  string;   // "<plugin_id>.<tool_name>"
+    args_json:       string;   // JSON object
+    request_id:      string;
+    token_budget:    int64;
+    max_tokens:      int32;
+    temperature:     float32;
+}
+
+table ToolResult {
+    correlation_id: uint64;
+    error:          ErrorCode = Ok;
+    payload:        string;   // result JSON or plain text
+    error_msg:      string;   // present when error != Ok
+}
+
+// ── Preprocessor call / result ────────────────────────────────────────────────
+
+table PreprocessCall {
+    correlation_id: uint64;
+    plugin_id:      string;
+    messages_json:  string;
+    request_id:     string;
+    token_budget:   int64;
+    max_tokens:     int32;
+    temperature:    float32;
+}
+
+table PreprocessResult {
+    correlation_id:         uint64;
+    decision:               PreprocDecision = Pass;
+    modified_messages_json: string;   // null = no change
+    response_text:          string;   // used when decision == Respond
+    error:                  ErrorCode = Ok;
+}
+
+// ── Generator call / result ───────────────────────────────────────────────────
+
+table GenerateCall {
+    correlation_id: uint64;
+    plugin_id:      string;
+    messages_json:  string;
+    request_id:     string;
+    token_budget:   int64;
+    max_tokens:     int32;
+    temperature:    float32;
+    streaming:      bool;
+}
+
+table GenerateChunk {
+    correlation_id: uint64;
+    token_text:     string;
+    is_done:        bool;
+}
+
+table GenerateResult {
+    correlation_id: uint64;
+    full_text:      string;
+    error:          ErrorCode = Ok;
+    error_msg:      string;
+    prompt_tokens:  int32;
+    completion_tokens: int32;
+}
+
+// ── Config sync / update ──────────────────────────────────────────────────────
+
+table ConfigEntry {
+    key:   string;
+    value: string;  // always a JSON-encoded value
+}
+
+table ConfigSync {
+    plugin_id: string;
+    entries:   [ConfigEntry];
+}
+
+table ConfigUpdate {
+    plugin_id: string;
+    delta:     [ConfigEntry];
+}
+
+// ── Operational ───────────────────────────────────────────────────────────────
+
+table Heartbeat {
+    seq: uint64;
+}
+
+table HeartbeatAck {
+    seq: uint64;
+}
+
+table StatusReport {
+    correlation_id: uint64;
+    message:        string;
+}
+
+table AbortCall {
+    correlation_id: uint64;
+}
+
+table ErrorReport {
+    plugin_id: string;
+    message:   string;
+    fatal:     bool;
+}
+
+// ── Top-level envelope ────────────────────────────────────────────────────────
+
+union MessageBody {
+    PluginAnnounce,
+    PluginEvent,
+    ToolCall,
+    ToolResult,
+    PreprocessCall,
+    PreprocessResult,
+    GenerateCall,
+    GenerateChunk,
+    GenerateResult,
+    ConfigSync,
+    ConfigUpdate,
+    Heartbeat,
+    HeartbeatAck,
+    StatusReport,
+    AbortCall,
+    ErrorReport,
+}
+
+table Envelope {
+    body: MessageBody;
+}
+
+root_type Envelope;

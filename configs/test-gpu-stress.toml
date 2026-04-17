@@ -1,0 +1,115 @@
+# ============================================================================
+# TEST: GPU heavy stress — high concurrency, large context, long outputs
+# ============================================================================
+# Designed for use with test_batch_concurrent.py --mode gpu-ctx or sustained.
+# Targets the GgmlEngine CUDA backend (same engine as test-batching-stress.toml)
+# with wider batch width and larger context to maximise KV cache pressure.
+#
+# Key differences vs test-batching-stress.toml:
+#   - context_size=8192  (forces paged_attention_v2 path in CudaEngine; stresses
+#                         KV reuse across many decode steps in GgmlEngine)
+#   - max_seqs=16        (double the batch width — fills GPU GEMM utilisation)
+#   - max_concurrent=16  (server accepts all 16 parallel HTTP requests)
+#   - kv_cache q8_0      (8-bit KV so 16 × 8k context fits in VRAM comfortably)
+#   - kv_unified=true    (each seq can use the full 8k window, not 8k/16 = 512)
+#   - max_tokens=512     (longer outputs — stress decode throughput, not just prefill)
+#   - request_timeout_ms=300000 (5 min — long generations need more time)
+#   - logging level=info (reduce log noise during sustained load)
+#
+# Run:
+#   .\build\windows-cuda\bin\truellm-server.exe -c configs\test-gpu-stress.toml
+#
+# Then any of:
+#   python test_batch_concurrent.py --mode burst     --n 16 --tokens 256
+#   python test_batch_concurrent.py --mode sustained --n 16 --tokens 256 --duration 120
+#   python test_batch_concurrent.py --mode gpu-ctx   --n 8  --tokens 512
+#   python test_batch_concurrent.py --mode ramp      --n 16 --tokens 128
+#
+# Watch for in logs:
+#   [Engine] Continuous batching ENABLED  max_seqs=16 max_queue=256
+#   [GgmlContext] KV cache: K=q8_0 V=q8_0 | flash_attn=on
+#   [GgmlModel] VRAM after load: ... MB free / ... MB total
+# ============================================================================
+
+[server]
+host               = "127.0.0.1"
+port               = 9099
+api_key            = ""
+cors_origins       = ["*"]
+request_timeout_ms = 300000       # 5 min — long generations with 16 concurrent seqs
+max_concurrent     = 16           # match inference.batching.max_seqs
+
+[model]
+path          = "C:\\Users\\chakr\\.lmstudio\\models\\lmstudio-community\\NVIDIA-Nemotron-3-Nano-4B-GGUF\\NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
+alias         = "nemotron-3-nano-4b"
+chat_template = "chatml"
+
+[inference]
+backend         = "cuda"
+context_size    = 8192            # large context → deep KV chains, v2 paged-attn path
+batch_size      = 512
+ubatch_size     = 512
+threads         = 0
+flash_attention = true
+mmap            = true
+mlock           = false
+
+[inference.kv_cache]
+type_k = "q8_0"                   # 8-bit KV: ~half the VRAM of f16; enables 16 × 8k context
+type_v = "q8_0"
+
+[inference.batching]
+enabled    = true
+max_seqs   = 16                   # decode 16 sequences per llama_decode() step
+max_queue  = 256
+kv_unified = true                 # each seq can use full 8k — not partitioned
+
+[inference.cuda]
+gpu_layers             = -1
+main_gpu               = 0
+tensor_split           = []
+gpu_memory_utilization = 0.90
+
+[sampling]
+temperature       = 0.6
+top_p             = 0.95
+top_k             = 40
+min_p             = 0.05
+repeat_penalty    = 1.1
+frequency_penalty = 0.0
+presence_penalty  = 0.0
+max_tokens        = 512           # long outputs to stress decode throughput
+seed              = -1
+
+[logging]
+level      = "info"               # keep logs readable under sustained load
+format     = "text"
+timestamps = true
+
+[hardware]
+cpu_threads                  = 0
+max_ram_gb                   = 0.0
+resource_monitor_interval_ms = 2000
+
+[hardware.gpu]
+enabled          = true
+device_id        = 0
+name_hint        = "RTX 5090"
+vram_capacity_gb = 0.0
+backend_api      = "cuda"
+
+[hardware.offload]
+use_gpu_vram         = true
+use_system_ram       = true
+gpu_layers           = -1
+vram_budget_fraction = 0.90
+
+[hardware.guardrails]
+preset           = "relaxed"
+allow_overcommit = false
+
+[runtime]
+engine = "cuda12-llama-cpp"
+
+[plugins]
+enabled = false

@@ -1,0 +1,102 @@
+# ===========================================================================
+# scenario-production.toml
+#
+# Purpose: Production deployment on a server with GPU.
+#          JSON logging for log aggregation, API key auth, strict guardrails.
+#          Start with: truellm --config configs/scenario-production.toml
+#
+# Required env vars:
+#   TRUELLM_API_KEY  -- API key for bearer auth
+# ===========================================================================
+
+[server]
+host               = "0.0.0.0"
+port               = 8080
+api_key            = "${ENV:TRUELLM_API_KEY}"
+cors_origins       = []          # Deny cross-origin requests; set explicitly if needed
+max_concurrent     = 16
+request_timeout_ms = 30000
+
+tls_enabled   = false            # Set true and provide cert/key for HTTPS termination
+tls_cert_file = ""               # e.g. "/etc/truellm/tls/server.crt"
+tls_key_file  = ""               # e.g. "/etc/truellm/tls/server.key"
+
+[model]
+path          = "/models/llama-3.1-70b-instruct-q4_k_m.gguf"
+alias         = "llama-3.1-70b"
+chat_template = "llama3"
+
+[inference]
+backend         = "cuda"
+context_size    = 8192
+batch_size      = 512
+ubatch_size     = 512
+flash_attention = true
+mmap            = true
+mlock           = false
+
+[inference.kv_cache]
+type_k  = "q8_0"                 # Quantized KV cache saves VRAM
+type_v  = "q8_0"
+
+[inference.cuda]
+gpu_layers             = -1      # Offload all layers
+gpu_memory_utilization = 0.92
+
+[inference.cuda_engine]
+paged_kv_block_size    = 16
+max_num_seqs           = 512
+gpu_memory_utilization = 0.92
+enforce_eager          = false
+
+[inference.batching]
+enabled    = true
+max_seqs   = 32
+max_queue  = 512
+kv_unified = true
+
+[sampling]
+temperature       = 0.7
+top_p             = 0.9
+top_k             = 0            # Disabled; rely on top_p
+max_tokens        = 4096
+frequency_penalty = 0.1
+seed              = -1           # Random seed per request
+
+[logging]
+level           = "info"
+format          = "json"         # Structured JSON for log aggregation (Splunk, Loki, etc.)
+file            = "/var/log/truellm/server.log"
+timestamps      = true
+source_location = false
+
+[hardware]
+cpu_threads = 4
+max_ram_gb  = 0.0
+
+[hardware.gpu]
+enabled        = true
+device_id      = 0
+backend_api    = "cuda"
+
+[hardware.offload]
+use_gpu_vram         = true
+use_system_ram       = true
+gpu_layers           = -1
+vram_budget_fraction = 0.95
+
+[hardware.guardrails]
+preset           = "strict"
+allow_overcommit = false
+
+[runtime]
+engine         = "cuda12-llama-cpp"
+engine_version = "latest"
+auto_update    = false
+update_channel = "stable"
+
+[plugins]
+enabled              = false
+plugin_dirs          = ["/opt/truellm/plugins"]
+restart_on_crash     = true
+max_restart_attempts = 5

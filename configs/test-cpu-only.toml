@@ -1,0 +1,93 @@
+# ============================================================================
+# TEST: CPU-only inference — no GPU offload
+#
+# All 32 layers run on CPU RAM. No CUDA kernels used.
+# Validates the cpu backend path and measures raw CPU throughput.
+#
+# Expected behaviour:
+#   - /truellm/v1/status → no "gpu" block (device_id = -1)
+#   - Model loads from RAM (mmap), slower first-token latency
+#   - ~2–5 tok/s on a modern CPU (vs 50–150 tok/s on GPU)
+#   - KV cache falls back to f16 regardless of config (CPU guard in ggml_context)
+#
+# Run:
+#   .\build\windows-cuda\bin\truellm-server.exe -c configs\test-cpu-only.toml -v
+# ============================================================================
+
+[server]
+host               = "127.0.0.1"
+port               = 9099
+api_key            = ""
+cors_origins       = ["*"]
+request_timeout_ms = 300000       # CPU is slow — 5 min timeout
+max_concurrent     = 1
+
+[model]
+path          = "C:\\Users\\chakr\\.lmstudio\\models\\lmstudio-community\\NVIDIA-Nemotron-3-Nano-4B-GGUF\\NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
+alias         = "nemotron-3-nano-4b"
+chat_template = "chatml"
+
+[inference]
+backend         = "cpu"          # <<< KEY: cpu backend — no CUDA path
+context_size    = 2048           # smaller context → less RAM pressure
+batch_size      = 512
+ubatch_size     = 256
+threads         = 0              # auto-detect hardware_concurrency
+flash_attention = false          # FA2 not supported on CPU
+mmap            = true           # mmap avoids loading full model into RAM at start
+mlock           = false
+
+[inference.kv_cache]
+type_k = "f16"                   # CPU build ignores quantized KV and falls back anyway
+type_v = "f16"
+
+[inference.batching]
+enabled   = false                # batching requires GPU for practical performance
+max_seqs  = 1
+max_queue = 1
+
+[inference.cuda]
+gpu_layers             = 0       # <<< KEY: zero GPU layers
+main_gpu               = 0
+tensor_split           = []
+gpu_memory_utilization = 0.0
+
+[sampling]
+temperature    = 0.6
+top_p          = 0.95
+top_k          = 40
+min_p          = 0.05
+repeat_penalty = 1.1
+max_tokens     = 64              # short — CPU is slow
+seed           = 42
+
+[logging]
+level  = "debug"
+format = "text"
+
+[hardware]
+cpu_threads = 0                  # 0 = auto (uses hardware_concurrency)
+max_ram_gb  = 0.0
+
+[hardware.gpu]
+enabled          = false         # <<< KEY: GPU disabled
+device_id        = -1
+name_hint        = ""
+vram_capacity_gb = 0.0
+backend_api      = "cuda"
+
+[hardware.offload]
+use_gpu_vram         = false
+use_system_ram       = true
+gpu_layers           = 0
+vram_budget_fraction = 0.0
+
+[hardware.guardrails]
+preset           = "relaxed"
+allow_overcommit = false
+
+[runtime]
+engine = "cpu-llama-cpp"         # cpu runtime
+
+[plugins]
+enabled = false

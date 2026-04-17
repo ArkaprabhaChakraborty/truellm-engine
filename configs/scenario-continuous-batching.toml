@@ -1,0 +1,58 @@
+# ===========================================================================
+# scenario-continuous-batching.toml
+#
+# Purpose: Validate continuous batching (vLLM-style) with the CPU backend.
+#          Runs multiple concurrent sequences in a single decode step.
+#
+# Usage: truellm --config configs/scenario-continuous-batching.toml
+# Test:  Send several concurrent requests to /v1/chat/completions.
+# ===========================================================================
+
+[server]
+host           = "0.0.0.0"
+port           = 9099
+api_key        = ""
+max_concurrent = 16              # Allow 16 parallel HTTP handler slots
+
+[model]
+path          = "./models/llama-3.2-3b-instruct-q4_k_m.gguf"
+alias         = "llama-3.2-3b-batch"
+chat_template = "llama3"
+
+[inference]
+backend      = "cpu"
+context_size = 8192              # Larger context to accommodate multiple sequences
+batch_size   = 512
+ubatch_size  = 512
+threads      = 0
+mmap         = true
+
+[inference.kv_cache]
+type_k  = "q8_0"                 # Quantized KV saves RAM when many sequences are live
+type_v  = "q8_0"
+
+# Continuous batching settings
+[inference.batching]
+enabled    = true
+max_seqs   = 8                   # Up to 8 sequences decoded together each step
+max_queue  = 64                  # Queue depth before 503
+kv_unified = true                # Each sequence can use the full context_size tokens
+
+[sampling]
+temperature = 0.8
+top_p       = 0.95
+max_tokens  = 512                # Shorter outputs to keep batching latency reasonable
+seed        = -1
+
+[logging]
+level  = "info"
+format = "text"
+
+[hardware]
+cpu_threads = 0
+
+[hardware.guardrails]
+preset = "balanced"
+
+[runtime]
+engine = "cpu-llama-cpp"

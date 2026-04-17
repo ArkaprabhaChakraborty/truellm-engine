@@ -1,0 +1,108 @@
+# ===========================================================================
+# scenario-web-fetch.toml
+#
+# Purpose: end-to-end test config for the tool_web_fetch native plugin.
+#
+# Plugins are built from the separate truellm-native-plugins repository:
+#   https://github.com/ArkaprabhaChakraborty/truellm-native-plugins
+#
+# Before running the server with this config:
+#   1. Clone and build truellm-native-plugins:
+#        cd ../truellm-native-plugins
+#        cmake --preset windows-release
+#        cmake --build build/windows-release --parallel
+#      The DLL lands at:
+#        truellm-native-plugins/build/windows-release/plugins/native/tool_web_fetch.dll
+#
+#   2. Update plugin_dirs below to the absolute path of that output directory,
+#      OR copy the DLL next to the server binary and point plugin_dirs there.
+#
+#   3. Start the server from this repo root:
+#        .\build\windows-cuda\bin\truellm-server.exe --config configs\scenario-web-fetch.toml
+#
+#   4. Run the integration tests from truellm-native-plugins:
+#        python tests\integration\python\test_web_fetch_plugin.py
+# ===========================================================================
+
+profile = "local-cpu"
+
+[server]
+host           = "127.0.0.1"
+port           = 9099
+api_key        = ""
+max_concurrent = 4
+
+[model]
+path          = "C:\\Users\\chakr\\.lmstudio\\models\\lmstudio-community\\NVIDIA-Nemotron-3-Nano-4B-GGUF\\NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
+chat_template = "llama3"
+alias         = "nemotron-3-nano-4b"
+
+[inference]
+backend      = "cpu"
+context_size = 4096
+threads      = 0
+mmap         = true
+mlock        = false
+flash_attention = true
+
+[inference.kv_cache]
+type_k = "f16"
+type_v = "f16"
+
+[sampling]
+temperature = 0.2    # low temperature for deterministic tool-use behavior
+top_p       = 0.95
+max_tokens  = 512
+seed        = 42     # fixed seed for reproducibility
+
+[logging]
+level  = "debug"     # debug so you can see plugin load and tool dispatch in logs
+format = "text"
+
+[hardware]
+cpu_threads = 0
+
+[hardware.offload]
+use_gpu_vram = false
+gpu_layers   = 0
+
+[hardware.guardrails]
+preset = "relaxed"
+
+[runtime]
+engine = "cpu-llama-cpp"
+
+# ---------------------------------------------------------------------------
+# Plugin configuration
+#
+# plugin_dirs must point at the truellm-native-plugins build output.
+# Use an absolute path or a path relative to the server's working directory.
+# Example (Windows): "C:/work/truellm/truellm-native-plugins/build/windows-release/plugins/native"
+# Example (Linux):   "/home/user/truellm-native-plugins/build/linux-release/plugins/native"
+# On Linux the file extension is .so instead of .dll.
+# ---------------------------------------------------------------------------
+[plugins]
+enabled               = true
+plugin_dirs           = ["../truellm-native-plugins/build/windows-release/plugins/native"]
+socket_path           = ""
+sidecar_timeout_ms    = 5000
+restart_on_crash      = true
+max_restart_attempts  = 3
+
+# ── Tool dispatch ─────────────────────────────────────────────────────────────
+tool_max_rounds = 5
+
+# ── Context splitter ──────────────────────────────────────────────────────────
+context_split_enabled             = true
+context_split_strategy            = "truncate"  # "summarize" | "truncate"
+context_split_trigger_fraction    = 0.5
+context_split_truncate_fraction   = 0.60
+context_split_auto_chunk_fraction = 0.55
+context_split_chunk_tokens        = 0           # 0 = auto
+context_split_max_chunks          = 6
+context_split_summary_tokens      = 200
+
+# Per-plugin settings readable via host->get_config("tool_web_fetch", key).
+[plugins.settings]
+tool_web_fetch.timeout_ms = "5000"
+tool_web_fetch.max_bytes  = "65536"

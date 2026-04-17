@@ -1,0 +1,93 @@
+# ============================================================================
+# TEST: Partial GPU offload — 16 of 32 layers on GPU, rest on CPU
+#
+# Nemotron-3-Nano-4B has 32 transformer layers.
+# This config offloads half to GPU, leaving the other half on CPU RAM.
+# Useful for machines with limited VRAM or to measure CPU/GPU split latency.
+#
+# Expected behaviour:
+#   - /truellm/v1/status → gpu.layers_on_gpu = 16
+#   - VRAM usage roughly half of full offload
+#   - Slower tok/s than full offload (CPU↔GPU data transfers per layer)
+#
+# Run:
+#   .\build\windows-cuda\bin\truellm-server.exe -c configs\test-partial-gpu.toml -v
+# ============================================================================
+
+[server]
+host               = "127.0.0.1"
+port               = 9099
+api_key            = ""
+cors_origins       = ["*"]
+request_timeout_ms = 120000        # CPU layers are slower
+max_concurrent     = 1
+
+[model]
+path          = "C:\\Users\\chakr\\.lmstudio\\models\\lmstudio-community\\NVIDIA-Nemotron-3-Nano-4B-GGUF\\NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
+alias         = "nemotron-3-nano-4b"
+chat_template = "chatml"
+
+[inference]
+backend         = "cuda"
+context_size    = 4096
+batch_size      = 512
+ubatch_size     = 512
+threads         = 0            # auto for CPU layers
+flash_attention = false        # flash attn needs full GPU path — disable for mixed
+mmap            = true
+mlock           = false
+
+[inference.kv_cache]
+type_k = "f16"                 # f16 is safest for CPU+GPU mixed
+type_v = "f16"
+
+[inference.batching]
+enabled   = false              # single request keeps timing cleaner for this test
+max_seqs  = 1
+max_queue = 1
+
+[inference.cuda]
+gpu_layers             = 16    # <<< KEY: only 16/32 layers on GPU
+main_gpu               = 0
+tensor_split           = []
+gpu_memory_utilization = 0.70  # lower fraction — VRAM shared with CPU layers
+
+[sampling]
+temperature    = 0.6
+top_p          = 0.95
+top_k          = 40
+min_p          = 0.05
+repeat_penalty = 1.1
+max_tokens     = 128
+seed           = 42            # fixed seed for reproducible timing comparisons
+
+[logging]
+level  = "debug"
+format = "text"
+
+[hardware]
+cpu_threads = 0
+max_ram_gb  = 0.0
+
+[hardware.gpu]
+enabled          = true
+device_id        = 0
+name_hint        = "RTX 5090"
+vram_capacity_gb = 0.0
+backend_api      = "cuda"
+
+[hardware.offload]
+use_gpu_vram         = true
+use_system_ram       = true
+gpu_layers           = 16      # mirrors inference.cuda.gpu_layers
+vram_budget_fraction = 0.70
+
+[hardware.guardrails]
+preset           = "relaxed"
+allow_overcommit = false
+
+[runtime]
+engine = "cuda12-llama-cpp"
+
+[plugins]
+enabled = false

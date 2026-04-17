@@ -1,0 +1,173 @@
+# ============================================================================
+# scenario-web-fetch-cuda.toml
+#
+# Purpose: end-to-end test for the tool_web_fetch native plugin on the
+# CUDA inference backend.
+#
+# Plugins are built from the separate truellm-native-plugins repository:
+#   https://github.com/ArkaprabhaChakraborty/truellm-native-plugins
+#
+# Before running:
+#   1. Clone and build truellm-native-plugins:
+#        cd ../truellm-native-plugins
+#        cmake --preset windows-release
+#        cmake --build build/windows-release --parallel
+#
+#   2. Update plugin_dirs below to point at the build output, then start:
+#        .\build\windows-cuda\bin\truellm-server.exe --config configs\scenario-web-fetch-cuda.toml
+#
+#   3. Run integration tests from truellm-native-plugins:
+#        python tests\integration\python\test_web_fetch_plugin.py
+# ============================================================================
+
+[server]
+host               = "127.0.0.1"
+port               = 9099
+api_key            = ""
+cors_origins       = ["*"]
+request_timeout_ms = 60000
+max_concurrent     = 4
+
+[model]
+path          = "C:\\Users\\chakr\\.lmstudio\\models\\lmstudio-community\\NVIDIA-Nemotron-3-Nano-4B-GGUF\\NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
+alias         = "nemotron-3-nano-4b"
+chat_template = "chatml"
+
+[inference]
+backend         = "cuda"
+context_size    = 1024
+batch_size      = 256
+ubatch_size     = 256
+threads         = 0
+flash_attention = true
+mmap            = true
+mlock           = false
+
+[inference.kv_cache]
+type_k = "f16"
+type_v = "f16"
+
+[inference.cuda_engine]
+paged_kv_block_size       = 16
+max_num_blocks            = 0      # auto-size from gpu_memory_utilization
+max_num_seqs              = 4
+num_cuda_streams          = 3
+use_fp8_kv                = false
+gpu_memory_utilization    = 0.80
+tensor_parallel_size      = 1
+enforce_eager             = true   # no graph capture -- isolate plugin dispatch behavior
+cuda_graph_max_batch_size = 1
+attention_layout          = "paged"
+
+[inference.cuda]
+gpu_layers             = -1
+main_gpu               = 0
+tensor_split           = []
+gpu_memory_utilization = 0.80
+
+[inference.batching]
+enabled   = true
+max_seqs  = 4
+max_queue = 32
+
+[sampling]
+temperature    = 0.2    # low but not zero -- gives model flexibility for tool formatting
+top_p          = 0.95
+top_k          = 40
+min_p          = 0.0
+repeat_penalty = 1.0
+max_tokens     = 256
+seed           = 42
+
+[logging]
+level           = "debug"
+format          = "text"
+timestamps      = true
+source_location = false
+
+[hardware]
+cpu_threads = 0
+max_ram_gb  = 0.0
+resource_monitor_interval_ms = 1000
+
+[hardware.gpu]
+enabled          = true
+device_id        = 0
+name_hint        = "RTX 5090"
+vram_capacity_gb = 0.0
+backend_api      = "cuda"
+
+[hardware.offload]
+use_gpu_vram         = true
+use_system_ram       = true
+gpu_layers           = -1
+vram_budget_fraction = 0.80
+
+[hardware.guardrails]
+preset           = "relaxed"
+allow_overcommit = false
+
+[runtime]
+engine = "cuda12-llama-cpp"
+
+# ---------------------------------------------------------------------------
+# Plugins — built from truellm-native-plugins repo.
+# Update plugin_dirs to the absolute path of your plugins build output.
+# Example: "C:/work/truellm/truellm-native-plugins/build/windows-release/plugins/native"
+# ---------------------------------------------------------------------------
+[plugins]
+enabled               = true
+plugin_dirs           = ["../truellm-native-plugins/build/windows-release/plugins/native"]
+socket_path           = ""
+sidecar_timeout_ms    = 5000
+restart_on_crash      = true
+max_restart_attempts  = 3
+
+# ── Tool dispatch ─────────────────────────────────────────────────────────────
+# tool_max_rounds
+#   Maximum tool-call / dispatch iterations per request.  After this many
+#   rounds the server returns whatever the model last generated.
+tool_max_rounds = 5
+
+# ── Context splitter ──────────────────────────────────────────────────────────
+# Triggered when a tool result is too large for the context window.
+#
+# context_split_enabled
+#   Master switch.  Set to false to disable splitting entirely.
+#
+# context_split_strategy
+#   "summarize" — per-chunk summarisation inference pass (slower, semantic).
+#   "truncate"  — hard-clip with no extra inference (fast, deterministic).
+#
+# context_split_trigger_fraction
+#   Trigger when raw tool content (in tokens) >= token_budget * fraction.
+#   Lower values trigger earlier / more aggressively.  Default: 0.5
+#
+# context_split_truncate_fraction
+#   When strategy = "truncate", keep at most token_budget * fraction chars.
+#   Default: 0.60
+#
+# context_split_auto_chunk_fraction
+#   When strategy = "summarize" and chunk_tokens = 0 (auto), use
+#   token_budget * fraction as the chunk token target.  Default: 0.55
+#
+# context_split_chunk_tokens
+#   Explicit chunk size in tokens; 0 = auto (uses auto_chunk_fraction).
+#
+# context_split_max_chunks
+#   Maximum chunks to summarise.  Extra chunks are dropped with a notice.
+#
+# context_split_summary_tokens
+#   Max tokens the model may generate per chunk summary.
+context_split_enabled             = true
+context_split_strategy            = "truncate"  # "summarize" | "truncate"
+context_split_trigger_fraction    = 0.5
+context_split_truncate_fraction   = 0.60
+context_split_auto_chunk_fraction = 0.55
+context_split_chunk_tokens        = 0           # 0 = auto
+context_split_max_chunks          = 6
+context_split_summary_tokens      = 200
+
+[plugins.settings]
+tool_web_fetch.timeout_ms = "5000"
+tool_web_fetch.max_bytes  = "65536"

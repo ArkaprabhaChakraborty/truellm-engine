@@ -1,0 +1,117 @@
+# ============================================================================
+# TrueLLM — CudaEngine smoke-test config
+# ============================================================================
+# Exercises the new paged-attention CudaEngine (GPU_Actions_2 implementation).
+# Requires: cmake --preset windows-cuda  (TRUELLM_BUILD_CUDA_ENGINE=ON)
+#
+# Run:
+#   .\build\windows-cuda\bin\truellm-server.exe -c configs\test-cuda-engine.toml -v
+#
+# Key things this config verifies:
+#   - [inference.cuda_engine] section is parsed correctly
+#   - CudaEngine is selected over GgmlEngine when backend=cuda
+#   - Paged KV allocator initialises (block_size=16, auto pool sizing)
+#   - /truellm/v1/status includes kv_cache + gpu blocks
+#   - FP8 KV path compiles (flag exposed; only active on sm_89+)
+#   - CUDA graph capture stub runs without crash (enforce_eager=false)
+# ============================================================================
+
+[server]
+host               = "127.0.0.1"
+port               = 9099
+api_key            = ""
+cors_origins       = ["*"]
+request_timeout_ms = 60000
+max_concurrent     = 4
+
+[model]
+path          = "C:\\Users\\chakr\\.lmstudio\\models\\lmstudio-community\\NVIDIA-Nemotron-3-Nano-4B-GGUF\\NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
+alias         = "nemotron-3-nano-4b"
+chat_template = "chatml"
+
+[inference]
+backend         = "cuda"       # Routes to CudaEngine when TRUELLM_BUILD_CUDA_ENGINE=ON
+context_size    = 4096
+batch_size      = 512
+ubatch_size     = 512
+threads         = 0
+flash_attention = true
+mmap            = true
+mlock           = false
+
+[inference.kv_cache]
+type_k  = "f16"
+type_v  = "f16"
+
+# ── CudaEngine-specific ───────────────────────────────────────────────────────
+# These fields are new — parsed by parse_cuda_engine() in config.cpp.
+# GgmlEngine ignores this section entirely.
+
+[inference.cuda_engine]
+paged_kv_block_size       = 16      # tokens per KV block (must be power of 2)
+max_num_blocks            = 0       # 0 = auto: fills gpu_memory_utilization * free VRAM
+max_num_seqs              = 64      # max live sequences (lower than default to save VRAM)
+num_cuda_streams          = 3       # Prefill / Decode / Copy stream roles
+use_fp8_kv                = false   # set true on sm_89+ (Ada/Hopper) for ~50% KV savings
+gpu_memory_utilization    = 0.85    # leave 15% free for CUDA overhead / other processes
+tensor_parallel_size      = 1       # single GPU — tp>1 hits not-implemented stub
+enforce_eager             = true    # disable CUDA graph capture (safer for first run)
+cuda_graph_max_batch_size = 8       # max decode batch captured in CUDA graphs
+attention_layout          = "paged" # "paged" | "flash_paged"
+
+[inference.cuda]
+gpu_layers               = -1
+main_gpu                 = 0
+tensor_split             = []
+gpu_memory_utilization   = 0.85
+use_flash_attention_cuda = true
+
+[inference.batching]
+enabled   = true
+max_seqs  = 4
+max_queue = 64
+
+[sampling]
+temperature       = 0.6
+top_p             = 0.95
+top_k             = 40
+min_p             = 0.05
+repeat_penalty    = 1.1
+frequency_penalty = 0.0
+presence_penalty  = 0.0
+max_tokens        = 256
+seed              = 42              # fixed seed for reproducible test output
+
+[logging]
+level            = "debug"          # trace the allocator init, stream creation, etc.
+format           = "text"
+timestamps       = true
+source_location  = true             # show file:line — useful for tracing new code paths
+
+[hardware]
+cpu_threads = 0
+max_ram_gb  = 0.0
+resource_monitor_interval_ms = 1000
+
+[hardware.gpu]
+enabled          = true
+device_id        = 0
+name_hint        = "RTX 5090"
+vram_capacity_gb = 0.0
+backend_api      = "cuda"
+
+[hardware.offload]
+use_gpu_vram         = true
+use_system_ram       = true
+gpu_layers           = -1
+vram_budget_fraction = 0.85
+
+[hardware.guardrails]
+preset           = "relaxed"
+allow_overcommit = false
+
+[runtime]
+engine = "cuda12-llama-cpp"
+
+[plugins]
+enabled = false

@@ -1,0 +1,225 @@
+# ============================================================================
+# TrueLLM Server Configuration
+# ============================================================================
+# CLI flags override any value here.
+# Environment variable substitution:  value = "${ENV:MY_VAR}"
+# Profile presets (CLI: --profile <name>):
+#   local-cpu   — single-user laptop, conservative defaults
+#   workstation — power-user desktop, larger context, auto-threads
+#   server      — production daemon, JSON logging, strict guardrails
+# ============================================================================
+
+
+# --------------------------------------------------------------------------
+# [server] — HTTP server
+# --------------------------------------------------------------------------
+[server]
+host                = "127.0.0.1"   # "0.0.0.0" to listen on all interfaces
+port                = 9099
+api_key             = ""             # Empty = no auth required
+# api_key           = "${ENV:TRUELLM_API_KEY}"   # Pull from environment
+cors_origins        = ["*"]          # Allowed CORS origins; ["https://myapp.com"]
+request_timeout_ms  = 30000          # Per-request hard timeout
+max_concurrent      = 4              # Parallel inference slots (continuous batching)
+
+# TLS (leave both empty to disable)
+tls_enabled         = false
+tls_cert_file       = ""             # Path to PEM certificate
+tls_key_file        = ""             # Path to PEM private key
+
+
+# --------------------------------------------------------------------------
+# [model] — What to load
+# --------------------------------------------------------------------------
+[model]
+path              = "./models/llama-3.1-8b-instruct-q4_k_m.gguf"
+# hf_repo         = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"  # HuggingFace repo ID
+# hf_file         = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"     # Specific file in repo
+alias             = "llama-3.1-8b"   # Name shown in /v1/models (defaults to filename)
+chat_template     = "auto"           # "auto" | "chatml" | "llama3" | "gemma" | "phi3"
+trust_remote_code = false            # Allow custom tokenizer code from HF
+
+
+# --------------------------------------------------------------------------
+# [inference] — Engine & generation knobs
+# --------------------------------------------------------------------------
+[inference]
+backend          = "cpu"    # "cpu" | "cuda"  (overridden by --backend CLI flag)
+context_size     = 4096     # Max context window in tokens (0 = model's built-in default)
+batch_size       = 512      # Token batch size for prompt processing
+ubatch_size      = 512      # Micro-batch for continuous batching decode
+threads          = 0        # CPU threads for inference (0 = auto-detect)
+flash_attention  = true     # Enable flash attention when the backend supports it
+mmap             = true     # Memory-map the GGUF file (fast load, low RSS)
+mlock            = false    # Lock model pages in RAM (prevents swap, needs privileges)
+numa             = "disabled"  # NUMA policy: "disabled" | "distribute" | "isolate"
+
+# KV cache precision
+[inference.kv_cache]
+type_k  = "f16"   # "f16" | "q8_0" | "q4_0"  (key cache)
+type_v  = "f16"   # "f16" | "q8_0" | "q4_0"  (value cache — independent)
+size_mb = 0       # KV cache size cap in MiB (0 = let llama.cpp decide)
+
+# CUDA-specific (only active when backend = "cuda")
+[inference.cuda]
+gpu_layers                = -1      # Layers to offload (-1 = all that fit in VRAM)
+main_gpu                  = 0       # Primary CUDA device index
+tensor_split              = []      # VRAM split ratios across GPUs, e.g. [0.6, 0.4]
+gpu_memory_utilization    = 0.90    # Max fraction of VRAM to use (0.0-1.0)
+use_flash_attention_cuda  = true
+compute_capability_major  = 0       # 0 = auto-detect (override for cross-compile)
+compute_capability_minor  = 0
+
+# Paged-attention CudaEngine (only active when backend = "cuda")
+# These settings govern the vLLM-style paged KV cache allocator.
+[inference.cuda_engine]
+paged_kv_block_size       = 16      # Tokens per KV block (must be a power of 2)
+max_num_blocks            = 0       # 0 = auto-size from free VRAM at startup
+max_num_seqs              = 256     # Maximum concurrent live sequences
+num_cuda_streams          = 3       # Stream pool size (minimum 3: prefill, decode, copy)
+use_fp8_kv                = false   # FP8 quantized KV cache (requires sm_89+ / Ada/Hopper)
+gpu_memory_utilization    = 0.90    # Fraction of free VRAM reserved for the KV pool
+tensor_parallel_size      = 1       # Number of GPUs for tensor parallelism (requires NCCL)
+enforce_eager             = false   # Disable CUDA graph capture (slower but uses less VRAM)
+cuda_graph_max_batch_size = 8       # Maximum batch size to capture CUDA graphs for
+attention_layout          = "paged" # "paged" | "flash_paged"
+
+# Continuous batching (vLLM-style multi-sequence decode)
+# Only effective when backend = "cpu" with the GgmlEngine.
+[inference.batching]
+enabled    = false   # Enable continuous batching; off by default
+max_seqs   = 8       # Maximum sequences processed in a single decode step
+max_queue  = 256     # Requests queued before returning HTTP 503
+kv_unified = true    # true  = each sequence may use the full context window
+                     # false = context is split equally between max_seqs sequences
+
+
+# --------------------------------------------------------------------------
+# [sampling] — Default generation parameters (all overridable per request)
+# --------------------------------------------------------------------------
+[sampling]
+temperature       = 0.7     # 0.0 = deterministic greedy, >1.0 = creative/random
+top_p             = 0.95    # Nucleus sampling cutoff (0.0 = disabled)
+top_k             = 40      # Top-K sampling (0 = disabled)
+min_p             = 0.05    # Min-P filtering (0.0 = disabled)
+repeat_penalty    = 1.1     # Penalise token repetition (1.0 = no penalty)
+frequency_penalty = 0.0     # OpenAI-style frequency penalty
+presence_penalty  = 0.0     # OpenAI-style presence penalty
+max_tokens        = 2048    # Default max generated tokens
+seed              = -1      # RNG seed (-1 = random each run)
+stop              = []      # Default stop strings, e.g. ["<|eot_id|>", "###"]
+
+
+# --------------------------------------------------------------------------
+# [logging] — Structured logging via spdlog
+# --------------------------------------------------------------------------
+[logging]
+level            = "debug"    # "trace" | "debug" | "info" | "warn" | "error"
+format           = "text"    # "text" (human-readable) | "json" (production ingestion)
+file             = ""        # Log to file path in addition to stdout (empty = stdout only)
+timestamps       = true      # Include timestamps in log lines
+source_location  = false     # Include file:line in every log entry (noisy, use for debug)
+
+
+# --------------------------------------------------------------------------
+# [hardware] — CPU / memory / GPU resource configuration
+# --------------------------------------------------------------------------
+[hardware]
+# CPU
+cpu_threads       = 0     # Threads used by the engine (0 = auto-detect logical cores)
+cpu_affinity      = []    # Pin to specific cores, e.g. [0, 1, 2, 3]
+
+# Memory limits (0.0 = no hard limit — use all available)
+max_ram_gb        = 0.0   # Maximum system RAM available for model weights + context
+                          # Example: 63.43 on an Intel Core Ultra 9 275HX system
+
+# Resource monitor
+resource_monitor_interval_ms = 1000   # Polling interval for CPU/RAM/VRAM metrics
+
+# GPU device selection
+[hardware.gpu]
+enabled           = true
+device_id         = 0               # CUDA / Vulkan device index (matches deviceId in nvidia-smi)
+name_hint         = ""              # Optional display name, e.g. "NVIDIA GeForce RTX 5090 Laptop GPU"
+vram_capacity_gb  = 0.0             # 0.0 = auto-detect (e.g. 23.89 for RTX 5090 Laptop)
+backend_api       = "cuda"          # "cuda" | "vulkan"
+                                    # CUDA: requires CUDA 12.x runtime
+                                    # Vulkan: cross-vendor GPU compute (llama.cpp Vulkan backend)
+
+# Model weight offload strategy
+[hardware.offload]
+use_gpu_vram          = true    # Offload weights to dedicated GPU VRAM
+use_system_ram        = true    # Spill remaining weights into system RAM
+use_shared_memory     = false   # Allow shared GPU memory (iGPU / UMA) as overflow
+                                # ON: limits offload to dedicated VRAM + RAM only
+                                #     (context may still use shared memory)
+                                # OFF: engine may use all addressable GPU memory
+gpu_layers            = -1      # Number of model layers to offload (-1 = fill VRAM first)
+vram_budget_fraction  = 1.0     # Fraction of detected VRAM to use for weights (0.0–1.0)
+
+# System overload guardrails
+[hardware.guardrails]
+# preset controls how aggressively the engine protects against OOM / overload:
+#   "off"      — No precautions; load whatever is asked. Not recommended.
+#   "relaxed"  — Mild: warn if model exceeds 50 % of available RAM+VRAM.
+#   "balanced" — Moderate: warn+cap at 75 % of available RAM+VRAM. (default)
+#   "strict"   — Strong: refuse load if model > 90 % of available RAM+VRAM.
+#   "custom"   — Use max_model_size_gb and *_fraction_limit values below.
+preset               = "balanced"
+max_model_size_gb    = 0.0    # Used only when preset = "custom" (0.0 = unlimited)
+allow_overcommit     = false  # Allow loading a model larger than the guardrail limit
+ram_fraction_limit   = 0.0    # Override RAM fraction cap (0.0 = use preset default)
+vram_fraction_limit  = 0.0    # Override VRAM fraction cap (0.0 = use preset default)
+
+
+# --------------------------------------------------------------------------
+# [runtime] — Inference engine runtime pack selection
+# --------------------------------------------------------------------------
+# Selects which llama.cpp runtime extension pack the engine loads at startup.
+# This mirrors the "Runtime Selections" panel in GUI frontends like LM Studio.
+#
+# Available engines:
+#   "cpu-llama-cpp"    — CPU-only llama.cpp (always available, no GPU required)
+#   "cuda12-llama-cpp" — NVIDIA CUDA 12.x accelerated llama.cpp (requires CUDA 12.8+)
+#   "cuda-llama-cpp"   — NVIDIA CUDA accelerated llama.cpp (CUDA 11/12 auto)
+#   "vulkan-llama-cpp" — Vulkan compute accelerated llama.cpp (cross-vendor GPU)
+# --------------------------------------------------------------------------
+[runtime]
+engine          = "cpu-llama-cpp"   # Runtime engine pack to use (see above)
+engine_version  = "latest"          # Pinned version string, e.g. "v2.8.0", or "latest"
+auto_update     = false             # Automatically upgrade runtime packs on startup
+update_channel  = "stable"          # "stable" | "nightly"
+
+# Harmony — chat history renderer & OpenAI-format conversation parser
+[runtime.harmony]
+enabled = false
+version = "latest"   # e.g. "v0.3.6"
+
+# Additional runtime extension packs (future / experimental)
+# [[runtime.extensions]]
+# name    = "cuda12-llama-cpp"
+# enabled = true
+# version = "v2.8.0"
+
+
+# --------------------------------------------------------------------------
+# [plugins] — Python plugin bridge (Part 2+, stubbed for Part 1)
+# --------------------------------------------------------------------------
+[plugins]
+enabled               = false
+python_path           = "python3"             # Python interpreter used for the sidecar
+plugin_dirs           = ["./plugins/python"]  # Directories scanned for plugin packages
+socket_path           = ""                    # IPC socket (empty = platform default:
+                                              #   Linux/macOS: /tmp/truellm-plugins.sock
+                                              #   Windows:     \\.\pipe\truellm-plugins)
+sidecar_timeout_ms    = 5000                  # How long to wait for sidecar startup
+restart_on_crash      = true                  # Auto-restart sidecar if it exits unexpectedly
+max_restart_attempts  = 3                     # Give up after this many consecutive crashes
+
+# Plugin runtime configuration key-value pairs.
+# Plugins access these via host_api.get_config(plugin_id, key).
+# Convention: use "plugin_id.key" for per-plugin settings, or bare "key" for global ones.
+# The engine first looks for "plugin_id.key", then falls back to bare "key".
+[plugins.settings]
+# tool_web_fetch.proxy_url = "http://proxy.internal:3128"
+# tool_web_fetch.max_bytes = "131072"

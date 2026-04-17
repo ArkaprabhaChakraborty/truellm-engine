@@ -1,0 +1,217 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "truellm-config",
+  "title": "TrueLLM Server Configuration",
+  "description": "JSON Schema for server.toml (TOML config file for truellm-server). Use with Even Better TOML (VS Code) or any TOML language server that supports JSON Schema.",
+  "type": "object",
+  "properties": {
+    "profile": {
+      "type": "string",
+      "enum": ["local-cpu", "workstation", "server", ""],
+      "description": "Named profile preset applied before TOML fields. One of: local-cpu, workstation, server."
+    },
+    "server": {
+      "type": "object",
+      "description": "HTTP server settings.",
+      "properties": {
+        "host": { "type": "string", "default": "127.0.0.1", "description": "Bind address. Use 0.0.0.0 to accept on all interfaces." },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 8080 },
+        "api_key": { "type": "string", "default": "", "description": "Bearer token for Authorization header. Empty = no auth. Supports ${ENV:VAR}." },
+        "cors_origins": { "type": "array", "items": { "type": "string" }, "default": ["*"] },
+        "request_timeout_ms": { "type": "integer", "minimum": 1000, "default": 30000 },
+        "max_concurrent": { "type": "integer", "minimum": 1, "default": 4 },
+        "tls_enabled": { "type": "boolean", "default": false },
+        "tls_cert_file": { "type": "string", "default": "" },
+        "tls_key_file": { "type": "string", "default": "" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "description": "Model file settings.",
+      "properties": {
+        "path": { "type": "string", "description": "Path to a GGUF model file." },
+        "hf_repo": { "type": "string", "description": "HuggingFace Hub repo ID (reserved)." },
+        "hf_file": { "type": "string", "description": "Specific filename in the HF repo (reserved)." },
+        "alias": { "type": "string", "description": "Model ID reported by /v1/models." },
+        "chat_template": {
+          "type": "string",
+          "enum": ["auto", "chatml", "llama3", "gemma", "phi3"],
+          "default": "auto"
+        },
+        "trust_remote_code": { "type": "boolean", "default": false }
+      }
+    },
+    "inference": {
+      "type": "object",
+      "description": "Inference backend settings.",
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": ["cpu", "ggml", "cuda"],
+          "default": "cpu"
+        },
+        "context_size": { "type": "integer", "minimum": 512, "default": 4096 },
+        "batch_size": { "type": "integer", "minimum": 1, "default": 512 },
+        "ubatch_size": { "type": "integer", "minimum": 1, "default": 512 },
+        "threads": { "type": "integer", "minimum": 0, "default": 0, "description": "0 = auto-detect." },
+        "flash_attention": { "type": "boolean", "default": true },
+        "mmap": { "type": "boolean", "default": true },
+        "mlock": { "type": "boolean", "default": false },
+        "numa": {
+          "type": "string",
+          "enum": ["disabled", "distribute", "isolate"],
+          "default": "disabled"
+        },
+        "kv_cache": {
+          "type": "object",
+          "properties": {
+            "type_k": { "type": "string", "enum": ["f16", "q8_0", "q4_0"], "default": "f16" },
+            "type_v": { "type": "string", "enum": ["f16", "q8_0", "q4_0"], "default": "f16" },
+            "size_mb": { "type": "integer", "minimum": 0, "default": 0, "description": "0 = auto." }
+          }
+        },
+        "cuda": {
+          "type": "object",
+          "description": "GgmlEngine CUDA offload settings.",
+          "properties": {
+            "gpu_layers": { "type": "integer", "default": -1, "description": "-1 = all layers." },
+            "main_gpu": { "type": "integer", "default": 0 },
+            "gpu_memory_utilization": { "type": "number", "minimum": 0.1, "maximum": 1.0, "default": 0.9 }
+          }
+        },
+        "cuda_engine": {
+          "type": "object",
+          "description": "CudaEngine paged-attention settings (used when backend=cuda).",
+          "properties": {
+            "paged_kv_block_size": { "type": "integer", "default": 16 },
+            "max_num_blocks": { "type": "integer", "default": 0, "description": "0 = auto from VRAM." },
+            "max_num_seqs": { "type": "integer", "default": 256 },
+            "num_cuda_streams": { "type": "integer", "minimum": 3, "default": 3 },
+            "use_fp8_kv": { "type": "boolean", "default": false, "description": "FP8 KV cache (sm_89+ only)." },
+            "gpu_memory_utilization": { "type": "number", "minimum": 0.1, "maximum": 1.0, "default": 0.9 },
+            "tensor_parallel_size": { "type": "integer", "minimum": 1, "default": 1 },
+            "enforce_eager": { "type": "boolean", "default": false },
+            "cuda_graph_max_batch_size": { "type": "integer", "default": 8 },
+            "attention_layout": { "type": "string", "enum": ["paged", "flash_paged"], "default": "paged" }
+          }
+        },
+        "batching": {
+          "type": "object",
+          "description": "Continuous batching (vLLM-style) settings.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "max_seqs": { "type": "integer", "minimum": 1, "default": 8 },
+            "max_queue": { "type": "integer", "minimum": 1, "default": 256 },
+            "kv_unified": { "type": "boolean", "default": true }
+          }
+        }
+      }
+    },
+    "sampling": {
+      "type": "object",
+      "description": "Default generation sampling parameters.",
+      "properties": {
+        "temperature": { "type": "number", "minimum": 0.0, "maximum": 2.0, "default": 0.7 },
+        "top_p": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.95 },
+        "top_k": { "type": "integer", "minimum": 0, "default": 40 },
+        "min_p": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.05 },
+        "repeat_penalty": { "type": "number", "minimum": 1.0, "default": 1.1 },
+        "frequency_penalty": { "type": "number", "default": 0.0 },
+        "presence_penalty": { "type": "number", "default": 0.0 },
+        "max_tokens": { "type": "integer", "minimum": 1, "default": 2048 },
+        "seed": { "type": "integer", "default": -1, "description": "-1 = random." },
+        "stop": { "type": "array", "items": { "type": "string" }, "default": [] }
+      }
+    },
+    "logging": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": ["trace", "debug", "info", "warn", "error"],
+          "default": "info"
+        },
+        "format": { "type": "string", "enum": ["text", "json"], "default": "text" },
+        "file": { "type": "string", "default": "", "description": "Log file path. Empty = stderr only." },
+        "timestamps": { "type": "boolean", "default": true },
+        "source_location": { "type": "boolean", "default": false }
+      }
+    },
+    "hardware": {
+      "type": "object",
+      "properties": {
+        "cpu_threads": { "type": "integer", "minimum": 0, "default": 0 },
+        "max_ram_gb": { "type": "number", "minimum": 0.0, "default": 0.0, "description": "0 = no limit." },
+        "gpu": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean", "default": true },
+            "device_id": { "type": "integer", "default": 0 },
+            "backend_api": { "type": "string", "enum": ["cuda", "vulkan"], "default": "cuda" },
+            "vram_capacity_gb": { "type": "number", "default": 0.0, "description": "0 = auto-detect." }
+          }
+        },
+        "offload": {
+          "type": "object",
+          "properties": {
+            "use_gpu_vram": { "type": "boolean", "default": true },
+            "use_system_ram": { "type": "boolean", "default": true },
+            "gpu_layers": { "type": "integer", "default": -1, "description": "-1 = fill VRAM." },
+            "vram_budget_fraction": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 1.0 }
+          }
+        },
+        "guardrails": {
+          "type": "object",
+          "properties": {
+            "preset": {
+              "type": "string",
+              "enum": ["off", "relaxed", "balanced", "strict", "custom"],
+              "default": "balanced"
+            },
+            "allow_overcommit": { "type": "boolean", "default": false },
+            "max_model_size_gb": { "type": "number", "default": 0.0 },
+            "ram_fraction_limit": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0 },
+            "vram_fraction_limit": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0 }
+          }
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "engine": {
+          "type": "string",
+          "enum": ["cpu-llama-cpp", "cuda12-llama-cpp", "cuda-llama-cpp", "vulkan-llama-cpp"],
+          "default": "cpu-llama-cpp"
+        },
+        "engine_version": { "type": "string", "default": "latest" },
+        "auto_update": { "type": "boolean", "default": false },
+        "update_channel": { "type": "string", "enum": ["stable", "nightly"], "default": "stable" },
+        "harmony": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "version": { "type": "string", "default": "latest" }
+          }
+        }
+      }
+    },
+    "plugins": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "python_path": { "type": "string", "default": "python3" },
+        "plugin_dirs": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "socket_path": { "type": "string", "default": "" },
+        "sidecar_timeout_ms": { "type": "integer", "minimum": 1000, "default": 5000 },
+        "restart_on_crash": { "type": "boolean", "default": true },
+        "max_restart_attempts": { "type": "integer", "minimum": 0, "default": 3 },
+        "settings": {
+          "type": "object",
+          "description": "Flat key-value store exposed to plugins via host_api.get_config(). Keys follow 'plugin_id.setting_name' convention.",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    }
+  }
+}

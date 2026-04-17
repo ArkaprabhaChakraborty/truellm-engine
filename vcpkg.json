@@ -1,0 +1,17 @@
+{
+  "name": "truellm",
+  "version-string": "0.1.0",
+  "description": "TrueLLM — C++ LLM inference server with plugin engine",
+  "homepage": "https://github.com/ArkaprabhaChakraborty/truellm",
+  "dependencies": [
+    "fmt",
+    "spdlog",
+    "nlohmann-json",
+    "toml11",
+    "cli11",
+    "gtest",
+    "cpp-httplib",
+    "openssl",
+    "benchmark"
+  ]
+}

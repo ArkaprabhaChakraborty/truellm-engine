@@ -1,0 +1,122 @@
+# ============================================================================
+# TEST: KV block eviction and reload
+# ============================================================================
+# Targets the eviction/reload fix:
+#   - evict_sequence() now stores the actual block count in evicted_seqs_[seq_id]
+#   - reload_sequence() reads that count back (was reading eviction_buf_blocks_
+#     which is the capacity, not the actual number of blocks for the sequence)
+#
+# To trigger eviction: pin max_num_blocks to a small fixed value so the pool
+# fills up and the engine must evict idle sequences to make room.
+#
+# What this exercises:
+#   - evicted_seqs_ stores and retrieves correct block count
+#   - Host pinned eviction buffer is sized correctly on first eviction
+#   - Reloaded KV data matches the original (numerically identical generation)
+#   - free_sequence() correctly decrements ref counts on evicted seq's cleared table
+#
+# Run:
+#   .\build\windows-cuda\bin\truellm-server.exe -c configs\test-cuda-eviction.toml -v
+#
+# Then send 6+ concurrent long requests. Watch for:
+#   [CudaAllocator] Out of blocks: need N, have M  → eviction kicks in
+#   [CudaEngine] Evicting seq_id=X (N blocks)
+#   [CudaEngine] Reloading seq_id=X (N blocks)
+# ============================================================================
+
+[server]
+host               = "127.0.0.1"
+port               = 9093
+api_key            = ""
+cors_origins       = ["*"]
+request_timeout_ms = 120000
+max_concurrent     = 6
+
+[model]
+path          = "C:\\Users\\chakr\\.lmstudio\\models\\lmstudio-community\\NVIDIA-Nemotron-3-Nano-4B-GGUF\\NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
+alias         = "nemotron-3-nano-4b"
+chat_template = "chatml"
+
+[inference]
+backend         = "cuda"
+context_size    = 2048
+batch_size      = 256
+ubatch_size     = 256
+threads         = 0
+flash_attention = true
+mmap            = true
+mlock           = false
+
+[inference.kv_cache]
+type_k = "f16"
+type_v = "f16"
+
+[inference.cuda_engine]
+paged_kv_block_size       = 16
+# Small fixed block pool — forces eviction when 4+ sequences are active.
+# With 32 layers, block_size=16, kv_heads=8, head_size=128, F16:
+#   bytes_per_block = 2 * 32 * 16 * 8 * 128 * 2 = 2 MB per block
+# 128 blocks = 256 MB — enough for ~2 full sequences at 2048 ctx
+max_num_blocks            = 128
+max_num_seqs              = 6        # more seqs than blocks can hold → eviction
+num_cuda_streams          = 3
+use_fp8_kv                = false
+gpu_memory_utilization    = 0.85
+tensor_parallel_size      = 1
+enforce_eager             = true
+cuda_graph_max_batch_size = 1
+attention_layout          = "paged"
+
+[inference.cuda]
+gpu_layers             = -1
+main_gpu               = 0
+tensor_split           = []
+gpu_memory_utilization = 0.85
+
+[inference.batching]
+enabled   = true
+max_seqs  = 6
+max_queue = 64
+
+[sampling]
+temperature    = 0.0      # greedy — easier to verify reload produces same output
+top_p          = 1.0
+top_k          = 1
+min_p          = 0.0
+repeat_penalty = 1.0
+max_tokens     = 256
+seed           = 42
+
+[logging]
+level           = "debug"
+format          = "text"
+timestamps      = true
+source_location = true
+
+[hardware]
+cpu_threads = 0
+max_ram_gb  = 0.0
+resource_monitor_interval_ms = 1000
+
+[hardware.gpu]
+enabled          = true
+device_id        = 0
+name_hint        = "RTX 5090"
+vram_capacity_gb = 0.0
+backend_api      = "cuda"
+
+[hardware.offload]
+use_gpu_vram         = true
+use_system_ram       = true
+gpu_layers           = -1
+vram_budget_fraction = 0.85
+
+[hardware.guardrails]
+preset           = "relaxed"
+allow_overcommit = false
+
+[runtime]
+engine = "cuda12-llama-cpp"
+
+[plugins]
+enabled = false

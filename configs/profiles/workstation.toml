@@ -1,0 +1,70 @@
+# ===========================================================================
+# profiles/workstation.toml
+#
+# Profile: workstation
+# Target:  Power-user desktop with a discrete GPU (e.g. RTX 4090 / RTX 5090).
+#
+# This file is a ready-to-copy base config for the "workstation" profile.
+# Equivalent to: truellm --profile workstation --config your.toml
+#
+# Key characteristics:
+#   - CUDA backend with full VRAM offload (gpu_layers = -1)
+#   - 8192-token context for longer conversations
+#   - Flash attention enabled for faster generation
+#   - 4 concurrent users
+#   - Balanced guardrails
+# ===========================================================================
+
+profile = "workstation"
+
+[server]
+host           = "127.0.0.1"
+port           = 9099
+api_key        = ""
+max_concurrent = 4
+
+[model]
+path          = "C:\\Users\\chakr\\.lmstudio\\models\\lmstudio-community\\NVIDIA-Nemotron-3-Nano-4B-GGUF\\NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
+chat_template = "llama3"
+
+[inference]
+backend         = "cuda"
+context_size    = 8192
+flash_attention = true
+mmap            = true
+mlock           = false
+
+[inference.kv_cache]
+type_k = "f16"
+type_v = "f16"
+
+[inference.cuda]
+gpu_layers             = -1
+gpu_memory_utilization = 0.90
+
+[sampling]
+temperature = 0.7
+top_p       = 0.95
+max_tokens  = 4096
+seed        = -1
+
+[logging]
+level  = "info"
+format = "text"
+
+[hardware]
+cpu_threads = 0
+
+[hardware.gpu]
+enabled   = true
+device_id = 0
+
+[hardware.offload]
+use_gpu_vram = true
+gpu_layers   = -1
+
+[hardware.guardrails]
+preset = "balanced"
+
+[runtime]
+engine = "cuda12-llama-cpp"

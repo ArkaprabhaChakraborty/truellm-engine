@@ -1,0 +1,62 @@
+# ===========================================================================
+# profiles/local-cpu.toml
+#
+# Profile: local-cpu
+# Target:  Laptop or single-user desktop — CPU-only inference.
+#
+# This file is a ready-to-copy base config for the "local-cpu" profile.
+# Equivalent to: truellm --profile local-cpu --config your.toml
+#
+# Key characteristics:
+#   - No GPU offload (cpu_layers = 0)
+#   - Conservative context window (4096 tokens)
+#   - mmap enabled, mlock disabled (lets the OS page model weights)
+#   - Single concurrent user (max_concurrent = 2)
+#   - Balanced guardrails to prevent OOM
+# ===========================================================================
+
+profile = "local-cpu"
+
+[server]
+host           = "127.0.0.1"
+port           = 9099
+api_key        = ""
+max_concurrent = 2
+
+[model]
+path          = "C:\\Users\\chakr\\.lmstudio\\models\\lmstudio-community\\NVIDIA-Nemotron-3-Nano-4B-GGUF\\NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
+chat_template = "llama3"
+
+[inference]
+backend      = "cpu"
+context_size = 4096
+threads      = 0          # 0 = auto-detect logical CPU count
+mmap         = true
+mlock        = false
+
+[inference.kv_cache]
+type_k = "f16"
+type_v = "f16"
+
+[sampling]
+temperature = 0.7
+top_p       = 0.95
+max_tokens  = 1024
+seed        = -1
+
+[logging]
+level  = "info"
+format = "text"
+
+[hardware]
+cpu_threads = 0
+
+[hardware.offload]
+use_gpu_vram = false
+gpu_layers   = 0
+
+[hardware.guardrails]
+preset = "balanced"
+
+[runtime]
+engine = "cpu-llama-cpp"

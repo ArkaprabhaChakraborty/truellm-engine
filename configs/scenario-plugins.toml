@@ -1,0 +1,68 @@
+# ===========================================================================
+# scenario-plugins.toml
+#
+# Purpose: Test the plugin system end-to-end.
+#          Loads the native tool_web_fetch plugin and a Python sidecar.
+#
+# File layout expected:
+#   ./plugins/native/tool_web_fetch/   -- built .dll / .so
+#   ./plugins/python/my_plugin/        -- manifest.toml + main.py
+#   ./plugins/js/my_plugin/            -- manifest.toml + main.ts
+#
+# Start with: truellm --config configs/scenario-plugins.toml
+# ===========================================================================
+
+[server]
+host           = "127.0.0.1"
+port           = 9099
+api_key        = ""
+max_concurrent = 4
+
+[model]
+path          = "./models/llama-3.2-3b-instruct-q4_k_m.gguf"
+alias         = "llama-3.2-3b"
+chat_template = "llama3"
+
+[inference]
+backend      = "cpu"
+context_size = 4096
+threads      = 0
+
+[inference.kv_cache]
+type_k = "f16"
+type_v = "f16"
+
+[sampling]
+temperature = 0.7
+top_p       = 0.95
+max_tokens  = 2048
+
+[logging]
+level  = "debug"
+format = "text"
+
+[hardware.guardrails]
+preset = "relaxed"
+
+[runtime]
+engine = "cpu-llama-cpp"
+
+# Plugin system configuration
+[plugins]
+enabled              = true
+python_path          = "python3"
+plugin_dirs          = [
+    "./plugins/native/tool_web_fetch",  # Native C++ plugin
+    "./plugins/python/my_plugin",       # Python sidecar plugin
+    "./plugins/js/my_plugin",           # JavaScript/TypeScript sidecar plugin
+]
+sidecar_timeout_ms   = 10000           # Give sidecars 10s to start up
+restart_on_crash     = true
+max_restart_attempts = 3
+
+# Per-plugin runtime settings accessible via host_api.get_config()
+[plugins.settings]
+# tool_web_fetch.proxy_url = "http://proxy.corp.example.com:3128"
+# tool_web_fetch.max_bytes = "131072"
+# Global setting available to all plugins:
+# log_level = "debug"

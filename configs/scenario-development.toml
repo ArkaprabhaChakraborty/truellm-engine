@@ -1,0 +1,68 @@
+# ===========================================================================
+# scenario-development.toml
+#
+# Purpose: Local development on a laptop or workstation.
+#          Single user, debug logging, no auth, CPU inference.
+#          Start with: truellm --config configs/scenario-development.toml
+# ===========================================================================
+
+profile = "local-cpu"
+
+[server]
+host               = "127.0.0.1"
+port               = 9099
+api_key            = ""          # No auth in development
+max_concurrent     = 2
+request_timeout_ms = 60000       # Longer timeout for slow CPU generation
+
+[model]
+path          = "./models/llama-3.2-3b-instruct-q4_k_m.gguf"
+alias         = "llama-3.2-3b-dev"
+chat_template = "llama3"
+
+[inference]
+backend      = "cpu"
+context_size = 4096
+threads      = 0                 # Auto-detect logical cores
+flash_attention = true
+mmap         = true
+mlock        = false
+
+[inference.kv_cache]
+type_k  = "f16"
+type_v  = "f16"
+
+[inference.batching]
+enabled  = false
+max_seqs = 2
+max_queue = 16
+
+[sampling]
+temperature    = 0.7
+top_p          = 0.95
+top_k          = 40
+max_tokens     = 1024
+seed           = 42              # Fixed seed for reproducible development runs
+
+[logging]
+level           = "debug"
+format          = "text"
+timestamps      = true
+source_location = false
+
+[hardware]
+cpu_threads = 0
+max_ram_gb  = 0.0
+
+[hardware.gpu]
+enabled = false
+
+[hardware.guardrails]
+preset = "relaxed"
+
+[runtime]
+engine = "cpu-llama-cpp"
+
+[plugins]
+enabled     = false
+plugin_dirs = ["./plugins"]

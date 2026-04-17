@@ -1,0 +1,116 @@
+# ============================================================================
+# TEST: Long context — paged_attention_v2 pre-allocated buffers
+# ============================================================================
+# Targets the v2 temp buffer pre-allocation fix:
+#   d_v2_exp_sums_, d_v2_max_logits_, d_v2_tmp_out_ allocated once at
+#   alloc_scratch_buffers(), not cudaMalloc/cudaFree per layer per token.
+#
+# paged_attention_v2 triggers when:
+#   (max_context_len / block_size) > 32
+# With block_size=16 and context=8192: 8192/16=512 >> 32  → v2 path always used.
+#
+# What this exercises:
+#   - v2_max_partitions_ computed at load time (no hot-path allocation)
+#   - All three v2 scratch buffers are reused across all decode steps
+#   - Per-layer KV addressing at large sequence lengths
+#   - RoPE using freq_base read from GGUF metadata (not hardcoded 10000)
+#   - RMSNorm using eps read from GGUF metadata (not hardcoded 1e-5)
+#
+# Run:
+#   .\build\windows-cuda\bin\truellm-server.exe -c configs\test-cuda-long-ctx.toml -v
+#
+# Then test with a long prompt (>2000 tokens) — watch decode TPS stays stable.
+# ============================================================================
+
+[server]
+host               = "127.0.0.1"
+port               = 9092
+api_key            = ""
+cors_origins       = ["*"]
+request_timeout_ms = 180000    # long context generation takes time
+max_concurrent     = 2
+
+[model]
+path          = "C:\\Users\\chakr\\.lmstudio\\models\\lmstudio-community\\NVIDIA-Nemotron-3-Nano-4B-GGUF\\NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
+alias         = "nemotron-3-nano-4b"
+chat_template = "chatml"
+
+[inference]
+backend         = "cuda"
+context_size    = 8192          # 8k context — v2 path at every decode step
+batch_size      = 512
+ubatch_size     = 512
+threads         = 0
+flash_attention = true
+mmap            = true
+mlock           = false
+
+[inference.kv_cache]
+type_k = "f16"
+type_v = "f16"
+
+[inference.cuda_engine]
+paged_kv_block_size       = 16
+max_num_blocks            = 0        # auto: allocator must handle 8k context worth of blocks
+max_num_seqs              = 2        # few seqs — most VRAM goes to KV blocks
+num_cuda_streams          = 3
+use_fp8_kv                = false
+gpu_memory_utilization    = 0.88
+tensor_parallel_size      = 1
+enforce_eager             = true
+cuda_graph_max_batch_size = 1
+attention_layout          = "paged"
+
+[inference.cuda]
+gpu_layers             = -1
+main_gpu               = 0
+tensor_split           = []
+gpu_memory_utilization = 0.88
+
+[inference.batching]
+enabled   = true
+max_seqs  = 2
+max_queue = 16
+
+[sampling]
+temperature    = 0.7
+top_p          = 0.95
+top_k          = 40
+min_p          = 0.05
+repeat_penalty = 1.1
+max_tokens     = 512
+seed           = -1
+
+[logging]
+level           = "debug"
+format          = "text"
+timestamps      = true
+source_location = true
+
+[hardware]
+cpu_threads = 0
+max_ram_gb  = 0.0
+resource_monitor_interval_ms = 2000
+
+[hardware.gpu]
+enabled          = true
+device_id        = 0
+name_hint        = "RTX 5090"
+vram_capacity_gb = 0.0
+backend_api      = "cuda"
+
+[hardware.offload]
+use_gpu_vram         = true
+use_system_ram       = true
+gpu_layers           = -1
+vram_budget_fraction = 0.88
+
+[hardware.guardrails]
+preset           = "relaxed"
+allow_overcommit = false
+
+[runtime]
+engine = "cuda12-llama-cpp"
+
+[plugins]
+enabled = false
