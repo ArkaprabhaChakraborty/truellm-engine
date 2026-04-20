@@ -5,6 +5,8 @@
 #include "plugin_bridge.h"
 #include "../inference/engine_interface.h"
 
+#include <truellm/version.h>
+
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
@@ -100,6 +102,97 @@ static void tramp_report_status(const truellm_context_t* ctx, const char* msg)
 
 static void* tramp_alloc(size_t n)   { return ::operator new(n, std::nothrow); }
 static void  tramp_dealloc(void* p)  { ::operator delete(p); }
+
+// ── api_minor >= 1 trampolines ─────────────────────────────────────────────
+
+static const int32_t* tramp_tokenize(const char* text, int32_t* out_count)
+{
+    auto* b = g_bridge.load(std::memory_order_acquire);
+    if (!b) { if (out_count) *out_count = 0; return nullptr; }
+    return b->vtable_tokenize(text, out_count);
+}
+
+static const char* tramp_detokenize(const int32_t* tokens, int32_t count)
+{
+    auto* b = g_bridge.load(std::memory_order_acquire);
+    return b ? b->vtable_detokenize(tokens, count) : "";
+}
+
+static const char* tramp_get_engine_config(const char* section, const char* key)
+{
+    auto* b = g_bridge.load(std::memory_order_acquire);
+    return b ? b->vtable_get_engine_config(section, key) : nullptr;
+}
+
+static const void* tramp_get_attention_weights(int32_t layer_idx,
+                                               int64_t* out_size_bytes)
+{
+    auto* b = g_bridge.load(std::memory_order_acquire);
+    if (!b) { if (out_size_bytes) *out_size_bytes = 0; return nullptr; }
+    return b->vtable_get_attention_weights(layer_idx, out_size_bytes);
+}
+
+static const void* tramp_get_hidden_states(int32_t layer_idx,
+                                           int64_t* out_size_bytes)
+{
+    auto* b = g_bridge.load(std::memory_order_acquire);
+    if (!b) { if (out_size_bytes) *out_size_bytes = 0; return nullptr; }
+    return b->vtable_get_hidden_states(layer_idx, out_size_bytes);
+}
+
+static const void* tramp_get_kv_cache_tensor(int32_t layer_idx, int32_t type,
+                                             int64_t out_shape[4])
+{
+    auto* b = g_bridge.load(std::memory_order_acquire);
+    if (!b) {
+        if (out_shape) { out_shape[0]=out_shape[1]=out_shape[2]=out_shape[3]=0; }
+        return nullptr;
+    }
+    return b->vtable_get_kv_cache_tensor(layer_idx, type, out_shape);
+}
+
+static truellm_error_t tramp_call_engine(
+    const truellm_context_t* ctx,
+    const char* messages_json,
+    const char* gen_params_json,
+    void (*on_token)(void*, const char*, int),
+    void* cb_data,
+    char** result_json_out)
+{
+    auto* b = g_bridge.load(std::memory_order_acquire);
+    if (!b) return TRUELLM_ERR_INTERNAL;
+    return b->vtable_call_engine(ctx, messages_json, gen_params_json,
+                                 on_token, cb_data, result_json_out);
+}
+
+static truellm_error_t tramp_inject_tokens(
+    truellm_context_t* ctx, int64_t pos, const char* tokens_json)
+{
+    auto* b = g_bridge.load(std::memory_order_acquire);
+    return b ? b->vtable_inject_tokens(ctx, pos, tokens_json)
+             : TRUELLM_ERR_INTERNAL;
+}
+
+static void tramp_set_context_metadata(truellm_context_t* ctx,
+                                       const char* key, const char* val)
+{
+    auto* b = g_bridge.load(std::memory_order_acquire);
+    if (b) b->vtable_set_context_metadata(ctx, key, val);
+}
+
+static const char* tramp_get_context_metadata(const truellm_context_t* ctx,
+                                               const char* key)
+{
+    auto* b = g_bridge.load(std::memory_order_acquire);
+    return b ? b->vtable_get_context_metadata(ctx, key) : nullptr;
+}
+
+static const char* tramp_get_server_capability(const truellm_context_t* ctx,
+                                                const char* cap_key)
+{
+    auto* b = g_bridge.load(std::memory_order_acquire);
+    return b ? b->vtable_get_server_capability(ctx, cap_key) : nullptr;
+}
 
 } // anonymous namespace
 
@@ -305,6 +398,183 @@ const char* PluginBridge::vtable_get_config(const std::string& plugin_id,
 }
 
 // ---------------------------------------------------------------------------
+// api_minor >= 1 vtable helpers
+// ---------------------------------------------------------------------------
+const int32_t* PluginBridge::vtable_tokenize(const char* text, int32_t* out_count)
+{
+    if (!engine_ || !text) { if (out_count) *out_count = 0; return nullptr; }
+    std::lock_guard<std::mutex> lk(tokenize_mu_);
+    tokenize_buf_ = engine_->tokenize(text);
+    if (out_count) *out_count = static_cast<int32_t>(tokenize_buf_.size());
+    return tokenize_buf_.empty() ? nullptr : tokenize_buf_.data();
+}
+
+const char* PluginBridge::vtable_detokenize(const int32_t* tokens, int32_t count)
+{
+    if (!engine_ || !tokens || count <= 0) return "";
+    std::lock_guard<std::mutex> lk(detokenize_mu_);
+    std::vector<int32_t> tok_vec(tokens, tokens + count);
+    detokenize_buf_ = engine_->detokenize(tok_vec);
+    return detokenize_buf_.c_str();
+}
+
+const char* PluginBridge::vtable_get_engine_config(const char* section,
+                                                    const char* key)
+{
+    // Exposes engine config values by dotted section.key path.
+    // Uses the same stable-pointer config_cache_ as vtable_get_config().
+    // Currently wired to the plugins.settings flat map via a "section.key" lookup;
+    // Phase C5 will add a dedicated engine-config lookup table.
+    if (!section || !key) return nullptr;
+    std::string composite = std::string(section) + "." + key;
+    std::lock_guard<std::mutex> lk(config_cache_mu_);
+    auto it = config_cache_.find(composite);
+    if (it != config_cache_.end()) return it->second.c_str();
+    return nullptr;
+}
+
+const void* PluginBridge::vtable_get_attention_weights(int32_t layer_idx,
+                                                        int64_t* out_size_bytes)
+{
+    if (!engine_) { if (out_size_bytes) *out_size_bytes = 0; return nullptr; }
+    return engine_->get_attention_weights(layer_idx, out_size_bytes);
+}
+
+const void* PluginBridge::vtable_get_hidden_states(int32_t layer_idx,
+                                                    int64_t* out_size_bytes)
+{
+    if (!engine_) { if (out_size_bytes) *out_size_bytes = 0; return nullptr; }
+    return engine_->get_hidden_states(layer_idx, out_size_bytes);
+}
+
+const void* PluginBridge::vtable_get_kv_cache_tensor(int32_t layer_idx,
+                                                      int32_t type,
+                                                      int64_t out_shape[4])
+{
+    if (!engine_) {
+        if (out_shape) { out_shape[0]=out_shape[1]=out_shape[2]=out_shape[3]=0; }
+        return nullptr;
+    }
+    return engine_->get_kv_cache_tensor(layer_idx, type, out_shape);
+}
+
+truellm_error_t PluginBridge::vtable_call_engine(
+    const truellm_context_t* ctx,
+    const char* messages_json,
+    const char* gen_params_json,
+    void (*on_token)(void*, const char*, int),
+    void* cb_data,
+    char** result_json_out)
+{
+    if (!engine_ || !ctx) return TRUELLM_ERR_INTERNAL;
+    if (!messages_json)   return TRUELLM_ERR_INVALID;
+
+    // Enforce recursion depth limit.
+    const int max_depth = cfg_.inference.rlm.max_hierarchy_depth;
+    if (ctx->recursion_depth >= max_depth) {
+        spdlog::warn("[PluginBridge] call_engine depth {} >= limit {}; aborting sub-call",
+                     ctx->recursion_depth, max_depth);
+        return TRUELLM_ERR_ABORT;
+    }
+
+    // Parse optional gen_params (temperature, max_tokens).
+    float temperature = ctx->temperature;
+    int32_t max_tokens = ctx->max_tokens;
+    if (gen_params_json) {
+        try {
+            auto jp = json::parse(gen_params_json);
+            if (jp.contains("temperature")) temperature = jp["temperature"].get<float>();
+            if (jp.contains("max_tokens"))  max_tokens  = jp["max_tokens"].get<int32_t>();
+        } catch (...) {}
+    }
+
+    // Build request — tokenise messages_json as a pre-formatted prompt.
+    GenerateRequest req;
+    req.temperature = temperature;
+    req.max_tokens  = max_tokens;
+    req.tokens      = engine_->tokenize(messages_json);
+    if (on_token) {
+        req.on_token = [on_token, cb_data](int32_t, const std::string& text) {
+            on_token(cb_data, text.c_str(), 0);
+        };
+    }
+
+    auto result = engine_->generate(req);
+    if (result.error != ErrorCode::Ok)
+        return TRUELLM_ERR_INTERNAL;
+
+    if (on_token) on_token(cb_data, "", 1);  // signal completion
+
+    if (result_json_out) {
+        // Allocate engine-owned JSON result string.
+        std::string out = "{\"text\":\"" + result.text + "\"}";
+        char* buf = static_cast<char*>(tramp_alloc(out.size() + 1));
+        if (buf) {
+            std::copy(out.begin(), out.end(), buf);
+            buf[out.size()] = '\0';
+        }
+        *result_json_out = buf;
+    }
+    return TRUELLM_OK;
+}
+
+truellm_error_t PluginBridge::vtable_inject_tokens(
+    truellm_context_t* ctx, int64_t pos, const char* tokens_json)
+{
+    // Token injection modifies the engine's KV cache; stub for Phase C3.
+    (void)ctx; (void)pos; (void)tokens_json;
+    spdlog::debug("[PluginBridge] inject_tokens called (stub — Phase C3)");
+    return TRUELLM_OK;
+}
+
+void PluginBridge::vtable_set_context_metadata(truellm_context_t* ctx,
+                                                const char* key, const char* val)
+{
+    if (!ctx || !key) return;
+    std::lock_guard<std::mutex> lk(ctx->metadata_mu);
+    if (val) ctx->metadata[key] = val;
+    else     ctx->metadata.erase(key);
+}
+
+const char* PluginBridge::vtable_get_context_metadata(
+    const truellm_context_t* ctx, const char* key)
+{
+    if (!ctx || !key) return nullptr;
+    std::lock_guard<std::mutex> lk(ctx->metadata_mu);
+    auto it = ctx->metadata.find(key);
+    if (it == ctx->metadata.end()) return nullptr;
+    // Return pointer into the metadata map — stable for the request's lifetime.
+    return it->second.c_str();
+}
+
+const char* PluginBridge::vtable_get_server_capability(
+    const truellm_context_t* ctx, const char* cap_key)
+{
+    if (!cap_key) return nullptr;
+    (void)ctx;
+    std::lock_guard<std::mutex> lk(cap_buf_mu_);
+    auto it = cap_cache_.find(cap_key);
+    if (it != cap_cache_.end()) return it->second.c_str();
+
+    // Compute capability value once and cache it.
+    std::string val;
+    const auto& inf = cfg_.inference;
+    std::string key(cap_key);
+
+    if      (key == TRUELLM_CAP_COMPRESSION)  val = inf.compression.enabled ? "1" : "0";
+    else if (key == TRUELLM_CAP_RLM)          val = inf.rlm.enabled ? "1" : "0";
+    else if (key == TRUELLM_CAP_RLM_MAX_DEPTH)val = std::to_string(inf.rlm.max_hierarchy_depth);
+    else if (key == TRUELLM_CAP_MEGAKERNEL)   val = "0"; // Phase M4 sets this
+    else if (key == TRUELLM_CAP_MEGAKERNEL_TILE) val = "8";
+    else if (key == TRUELLM_CAP_ATTN_WEIGHTS) val = "0"; // Phase M4 sets this
+    else if (key == TRUELLM_CAP_HIDDEN_STATES)val = "0"; // Phase M4 sets this
+    else return nullptr;
+
+    auto [ins_it, _ok] = cap_cache_.emplace(key, std::move(val));
+    return ins_it->second.c_str();
+}
+
+// ---------------------------------------------------------------------------
 // build_host_vtable
 // ---------------------------------------------------------------------------
 void PluginBridge::build_host_vtable()
@@ -333,6 +603,19 @@ void PluginBridge::build_host_vtable()
 
     host_vtable_.alloc   = tramp_alloc;
     host_vtable_.dealloc = tramp_dealloc;
+
+    // ── api_minor >= 1 ────────────────────────────────────────────────────────
+    host_vtable_.tokenize               = tramp_tokenize;
+    host_vtable_.detokenize             = tramp_detokenize;
+    host_vtable_.get_engine_config      = tramp_get_engine_config;
+    host_vtable_.get_attention_weights  = tramp_get_attention_weights;
+    host_vtable_.get_hidden_states      = tramp_get_hidden_states;
+    host_vtable_.get_kv_cache_tensor    = tramp_get_kv_cache_tensor;
+    host_vtable_.call_engine            = tramp_call_engine;
+    host_vtable_.inject_tokens          = tramp_inject_tokens;
+    host_vtable_.set_context_metadata   = tramp_set_context_metadata;
+    host_vtable_.get_context_metadata   = tramp_get_context_metadata;
+    host_vtable_.get_server_capability  = tramp_get_server_capability;
 }
 
 // ---------------------------------------------------------------------------

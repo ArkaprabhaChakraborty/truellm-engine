@@ -131,6 +131,40 @@ public:
         (void)text;
         return {};
     }
+
+    // ── api_minor >= 1 (compression / RLM support) ────────────────────────────
+
+    // Returns per-token hidden state vectors for the given layer from the last
+    // forward pass. Shape: [seq_len × (head_dim * num_heads)], row-major F32.
+    // Buffer is engine-owned; valid until next generate(). nullptr = unsupported.
+    // out_size_bytes receives byte count of the returned buffer.
+    virtual const void* get_hidden_states(int32_t layer_idx,
+                                          int64_t* out_size_bytes) {
+        (void)layer_idx;
+        if (out_size_bytes) *out_size_bytes = 0;
+        return nullptr;
+    }
+
+    // Returns [num_heads × seq_len × seq_len] row-major F32 attention weights
+    // for the given layer. Engine-owned; valid until next generate().
+    // nullptr when: CPU backend, megakernel_save_attn=false, seq_len too large.
+    virtual const void* get_attention_weights(int32_t layer_idx,
+                                              int64_t* out_size_bytes) {
+        (void)layer_idx;
+        if (out_size_bytes) *out_size_bytes = 0;
+        return nullptr;
+    }
+
+    // Returns the raw KV cache tensor for the given layer.
+    // out_shape[4] = {num_blocks, num_kv_heads, block_size, head_dim}.
+    // type: 0 = keys, 1 = values.
+    // nullptr on CPU backend or when paged-attention is not active.
+    virtual const void* get_kv_cache_tensor(int32_t layer_idx, int32_t type,
+                                            int64_t out_shape[4]) {
+        (void)layer_idx; (void)type;
+        if (out_shape) { out_shape[0] = out_shape[1] = out_shape[2] = out_shape[3] = 0; }
+        return nullptr;
+    }
 };
 
 // ---------------------------------------------------------------------------

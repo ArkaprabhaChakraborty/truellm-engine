@@ -8,7 +8,9 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 // truellm_context_t is declared in the public context.h as an opaque C tag.
 // We define the concrete struct here so C++ code in the engine can construct it.
@@ -21,4 +23,16 @@ struct truellm_context_t {
     float        temperature   = 0.7f;
     // Streaming sink for report_status; nullptr in non-streaming mode.
     std::function<void(const std::string&)> status_sink;
+
+    // ── api_minor >= 1 fields ────────────────────────────────────────────────
+    // Tracks how many nested call_engine() sub-calls are in flight for this ctx.
+    // ChunkEncoder increments this before calling and decrements after.
+    // Invariant: sub-call contexts always have status_sink = nullptr.
+    int32_t recursion_depth = 0;
+
+    // Arbitrary per-request string metadata shared across all plugin callbacks
+    // for the same request. set_context_metadata / get_context_metadata are
+    // thread-safe for concurrent plugin callbacks via metadata_mu_.
+    std::unordered_map<std::string, std::string> metadata;
+    mutable std::mutex                           metadata_mu;
 };

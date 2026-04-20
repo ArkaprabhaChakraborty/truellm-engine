@@ -38,6 +38,38 @@ static json error_response(int status, const std::string& msg,
 }
 
 // ---------------------------------------------------------------------------
+// sanitize_utf8 — drop a trailing partial UTF-8 sequence so the string is
+// always valid UTF-8. Model output truncated mid-multibyte character (e.g.
+// when max_tokens lands between BPE bytes) would otherwise cause
+// nlohmann::json::dump() to throw type_error.316 and turn the whole
+// response into a 500.  We truncate to the last complete code point.
+// ---------------------------------------------------------------------------
+static std::string sanitize_utf8(const std::string& s)
+{
+    size_t i = 0;
+    size_t last_good = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t need;
+        if      ((c & 0x80) == 0x00) need = 1;   // 0xxxxxxx
+        else if ((c & 0xE0) == 0xC0) need = 2;   // 110xxxxx
+        else if ((c & 0xF0) == 0xE0) need = 3;   // 1110xxxx
+        else if ((c & 0xF8) == 0xF0) need = 4;   // 11110xxx
+        else { ++i; continue; }                  // stray continuation byte
+        if (i + need > s.size()) break;          // incomplete tail → drop it
+        bool ok = true;
+        for (size_t k = 1; k < need; ++k) {
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) { ok = false; break; }
+        }
+        if (!ok) { ++i; continue; }
+        i += need;
+        last_good = i;
+    }
+    if (last_good == s.size()) return s;
+    return s.substr(0, last_good);
+}
+
+// ---------------------------------------------------------------------------
 // resolve_template — pick the right template name for a model when the user
 // has not explicitly configured one ("auto").
 //
@@ -946,16 +978,25 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
             sink.write(first_msg.data(), first_msg.size());
 
             int n_tok = 0;
-            greq.on_token = [&](int32_t id, const std::string& piece) {
+            // Per-stream UTF-8 carry buffer: BPE pieces may split a multibyte
+            // character across two on_token calls.  We emit only bytes up to
+            // the last complete code point, and stash the trailing partial
+            // sequence for the next piece.
+            greq.on_token = [&, utf8_carry = std::string()](int32_t id,
+                                                            const std::string& piece) mutable {
                 ++n_tok;
                 spdlog::trace("[OpenAI] stream tok[{}] id={} piece={}", n_tok, id,
                               piece.empty() ? "<empty>" : piece);
+                utf8_carry += piece;
+                std::string emit = sanitize_utf8(utf8_carry);
+                utf8_carry.erase(0, emit.size());
+                if (emit.empty()) return;   // waiting on more bytes
                 json chunk = {
                     {"id",      req_id},
                     {"object",  "chat.completion.chunk"},
                     {"model",   model_id},
                     {"choices", json::array({
-                        {{"delta",        {{"content", piece}}},
+                        {{"delta",        {{"content", emit}}},
                          {"index",        0},
                          {"finish_reason", nullptr}}
                     })}
@@ -1180,7 +1221,7 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
             {"model",   model_id},
             {"choices", json::array({
                 {{"message",      {{"role",    "assistant"},
-                                   {"content", result.text}}},
+                                   {"content", sanitize_utf8(result.text)}}},
                  {"index",        0},
                  {"finish_reason","stop"}}
             })},

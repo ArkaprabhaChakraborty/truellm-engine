@@ -158,6 +158,98 @@ void parse_inference(const toml::value& root, InferenceConfig& out)
         out.batching.max_queue  = toml::find_or<int> (b, "max_queue",  out.batching.max_queue);
         out.batching.kv_unified = toml::find_or<bool>(b, "kv_unified", out.batching.kv_unified);
     }
+
+    if (t.contains("compression")) {
+        const auto& c = toml::find(t, "compression");
+        out.compression.enabled  = toml::find_or<bool>(c, "enabled", out.compression.enabled);
+        out.compression.pipeline = find_str(c, "pipeline", out.compression.pipeline);
+
+        if (c.contains("presis")) {
+            const auto& p = toml::find(c, "presis");
+            auto& pr = out.compression.presis;
+            pr.enabled             = toml::find_or<bool>(p, "enabled",             pr.enabled);
+            pr.threshold           = static_cast<float>(toml::find_or<double>(p, "threshold",
+                                         static_cast<double>(pr.threshold)));
+            pr.keep_fraction       = static_cast<float>(toml::find_or<double>(p, "keep_fraction",
+                                         static_cast<double>(pr.keep_fraction)));
+            pr.importance_layers   = toml::find_or<int>(p, "importance_layers",   pr.importance_layers);
+            pr.fallback_tfidf      = toml::find_or<bool>(p, "fallback_tfidf",     pr.fallback_tfidf);
+            pr.max_seqlen_for_attn = toml::find_or<int>(p, "max_seqlen_for_attn", pr.max_seqlen_for_attn);
+        }
+
+        if (c.contains("tome")) {
+            const auto& p = toml::find(c, "tome");
+            auto& tm = out.compression.tome;
+            tm.enabled          = toml::find_or<bool>(p, "enabled",          tm.enabled);
+            tm.r                = toml::find_or<int> (p, "r",                tm.r);
+            tm.start_layer      = toml::find_or<int> (p, "start_layer",      tm.start_layer);
+            tm.apply_all_layers = toml::find_or<bool>(p, "apply_all_layers", tm.apply_all_layers);
+            tm.merge_mode       = find_str(p, "merge_mode",                   tm.merge_mode);
+        }
+
+        if (c.contains("fastv")) {
+            const auto& p = toml::find(c, "fastv");
+            auto& fv = out.compression.fastv;
+            fv.enabled           = toml::find_or<bool>(p, "enabled",     fv.enabled);
+            fv.start_layer       = toml::find_or<int> (p, "start_layer", fv.start_layer);
+            fv.keep_ratio        = static_cast<float>(toml::find_or<double>(p, "keep_ratio",
+                                       static_cast<double>(fv.keep_ratio)));
+            fv.importance_metric = find_str(p, "importance_metric",      fv.importance_metric);
+        }
+
+        if (c.contains("pyramid_drop")) {
+            const auto& p = toml::find(c, "pyramid_drop");
+            auto& pd = out.compression.pyramid_drop;
+            pd.enabled               = toml::find_or<bool>(p, "enabled",      pd.enabled);
+            pd.final_keep_ratio      = static_cast<float>(toml::find_or<double>(p, "final_keep_ratio",
+                                           static_cast<double>(pd.final_keep_ratio)));
+            pd.drop_schedule         = find_str(p, "drop_schedule",            pd.drop_schedule);
+            pd.warmup_layers         = toml::find_or<int>(p, "warmup_layers",  pd.warmup_layers);
+            pd.protect_last_n_tokens = toml::find_or<int>(p, "protect_last_n_tokens",
+                                           pd.protect_last_n_tokens);
+        }
+
+        if (c.contains("kv_kivi")) {
+            const auto& p = toml::find(c, "kv_kivi");
+            auto& ki = out.compression.kv_kivi;
+            ki.enabled           = toml::find_or<bool>(p, "enabled",           ki.enabled);
+            ki.bits              = toml::find_or<int> (p, "bits",              ki.bits);
+            ki.residual_length   = toml::find_or<int> (p, "residual_length",   ki.residual_length);
+            ki.key_granularity   = find_str(p, "key_granularity",               ki.key_granularity);
+            ki.value_granularity = find_str(p, "value_granularity",             ki.value_granularity);
+            ki.pre_rope_keys     = toml::find_or<bool>(p, "pre_rope_keys",     ki.pre_rope_keys);
+        }
+
+        if (c.contains("kv_vq")) {
+            const auto& p = toml::find(c, "kv_vq");
+            auto& vq = out.compression.kv_vq;
+            vq.enabled             = toml::find_or<bool>(p, "enabled",             vq.enabled);
+            vq.codebook_size       = toml::find_or<int> (p, "codebook_size",       vq.codebook_size);
+            vq.update_rate         = static_cast<float>(toml::find_or<double>(p, "update_rate",
+                                         static_cast<double>(vq.update_rate)));
+            vq.residual_depth      = toml::find_or<int> (p, "residual_depth",      vq.residual_depth);
+            vq.outlier_tracing     = toml::find_or<bool>(p, "outlier_tracing",     vq.outlier_tracing);
+            vq.calibration_text    = find_str(p, "calibration_text",               vq.calibration_text);
+            vq.disable_in_subcalls = toml::find_or<bool>(p, "disable_in_subcalls", vq.disable_in_subcalls);
+        }
+    }
+
+    if (t.contains("recursive_lm")) {
+        const auto& r = toml::find(t, "recursive_lm");
+        auto& rlm = out.rlm;
+        rlm.enabled                  = toml::find_or<bool>(r, "enabled",                  rlm.enabled);
+        rlm.chunk_size_tokens        = toml::find_or<int> (r, "chunk_size_tokens",        rlm.chunk_size_tokens);
+        rlm.chunk_overlap_tokens     = toml::find_or<int> (r, "chunk_overlap_tokens",     rlm.chunk_overlap_tokens);
+        rlm.summary_tokens_per_chunk = toml::find_or<int> (r, "summary_tokens_per_chunk", rlm.summary_tokens_per_chunk);
+        rlm.max_hierarchy_depth      = toml::find_or<int> (r, "max_hierarchy_depth",      rlm.max_hierarchy_depth);
+        rlm.chunk_cache_enabled      = toml::find_or<bool>(r, "chunk_cache_enabled",      rlm.chunk_cache_enabled);
+        if (rlm.max_hierarchy_depth > 1) {
+            spdlog::warn("[Config] inference.recursive_lm.max_hierarchy_depth={} > 1 — "
+                         "depth=2 causes 95× latency blowup (arXiv 2512.24601); "
+                         "only use with summarization-finetuned models",
+                         rlm.max_hierarchy_depth);
+        }
+    }
 }
 
 // Parse [sampling]

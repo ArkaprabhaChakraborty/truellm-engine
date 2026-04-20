@@ -71,6 +71,100 @@ struct CudaEngineConfig {
     bool  enforce_eager             = false;  // disable CUDA graph capture
     int   cuda_graph_max_batch_size = 8;      // max batch for graph capture
     std::string attention_layout    = "paged"; // "paged" | "flash_paged"
+    // Megakernel cooperative launch (Phase M4+, sm_70+).
+    // Falls back to legacy ggml+vllm path when false.
+    bool  use_megakernel            = false;
+    bool  megakernel_save_attn      = false;  // capture attn weights for Presis
+    bool  megakernel_save_hidden    = false;  // capture hidden states for ToMe
+};
+
+// ─── [inference.compression.presis] ──────────────────────────────────────────
+struct PresisConfig {
+    bool        enabled             = true;
+    float       threshold           = 0.85f; // trigger when seq_len > threshold × context budget
+    float       keep_fraction       = 0.60f; // retain top keep_fraction tokens by importance
+    int         importance_layers   = 4;     // layers to average attention over
+    bool        fallback_tfidf      = true;  // use TF-IDF when attn weights unavailable
+    int         max_seqlen_for_attn = 2048;  // disable attention scoring above this (OOM guard)
+};
+
+// ─── [inference.compression.tome] ────────────────────────────────────────────
+struct ToMeConfig {
+    bool        enabled         = false;
+    int         r               = 8;     // token pairs to merge per application
+    int         start_layer     = 0;     // first layer to apply bipartite matching
+    bool        apply_all_layers = false; // apply at every layer (true) or once pre-inference
+    std::string merge_mode      = "mean"; // "mean" | "max"
+};
+
+// ─── [inference.compression.fastv] ───────────────────────────────────────────
+struct FastVConfig {
+    bool        enabled          = false;
+    int         start_layer      = 8;    // begin token pruning after this layer
+    float       keep_ratio       = 0.50f;
+    std::string importance_metric = "attn_sum"; // "attn_sum" | "attn_max"
+};
+
+// ─── [inference.compression.pyramid_drop] ────────────────────────────────────
+struct PyramidDropConfig {
+    bool        enabled          = false;
+    float       final_keep_ratio = 0.30f;
+    std::string drop_schedule    = "cosine"; // "cosine" | "linear"
+    int         warmup_layers    = 4;
+    int         protect_last_n_tokens = 8;  // never drop recent query tokens
+};
+
+// ─── [inference.compression.kv_kivi] ─────────────────────────────────────────
+struct KiviConfig {
+    bool        enabled           = false;
+    int         bits              = 8;   // 4 or 8
+    int         residual_length   = 128; // recent N tokens stored unquantized at FP16
+    std::string key_granularity   = "per_channel"; // per-channel for keys (KVQuant finding)
+    std::string value_granularity = "per_token";   // per-token for values
+    bool        pre_rope_keys     = true; // quantize keys before RoPE application
+};
+
+// ─── [inference.compression.kv_vq] ───────────────────────────────────────────
+// Online vector quantization — CUDA only; occupies TRUELLM_KERNEL_CACHE slot.
+struct VqConfig {
+    bool        enabled             = false;
+    int         codebook_size       = 256;
+    float       update_rate         = 0.001f; // EMA α for codebook updates
+    int         residual_depth      = 1;      // 1 = standard VQ; 8 = residual VQ
+    bool        outlier_tracing     = true;   // OTT: store outlier tokens at FP16
+    std::string calibration_text    = "";     // path to calibration file for cold-start
+    bool        disable_in_subcalls = true;   // no VQ during RLM ChunkEncoder sub-calls
+};
+
+// ─── [inference.compression] ─────────────────────────────────────────────────
+struct CompressionConfig {
+    bool        enabled  = false;
+
+    // Ordered, comma-separated pipeline for token-level stages run before inference.
+    // Valid names: "presis", "tome"
+    // Note: "fastv" and "pyramid_drop" run inside the forward pass (megakernel slots),
+    //   not in this pipeline. "kv_kivi" and "kv_vq" run during inference.
+    // Architectural invariant: "tome" must appear before "presis" if both present.
+    std::string pipeline = "presis";
+
+    PresisConfig      presis;
+    ToMeConfig        tome;
+    FastVConfig       fastv;
+    PyramidDropConfig pyramid_drop;
+    KiviConfig        kv_kivi;
+    VqConfig          kv_vq;
+};
+
+// ─── [inference.recursive_lm] ─────────────────────────────────────────────────
+struct RlmConfig {
+    bool    enabled                 = false;
+    int     chunk_size_tokens       = 512;
+    int     chunk_overlap_tokens    = 64;  // overlap prevents boundary information loss
+    int     summary_tokens_per_chunk = 32;
+    // WARNING: depth > 1 causes 95× latency blowup (arXiv 2512.24601).
+    // Hard production limit = 1. Only set to 2 with summarization-finetuned models.
+    int     max_hierarchy_depth     = 1;
+    bool    chunk_cache_enabled     = false; // Phase C6 only — per-session chunk reuse
 };
 
 // ─── [inference.batching] ────────────────────────────────────────────────────
@@ -100,6 +194,8 @@ struct InferenceConfig {
     CudaInferenceConfig cuda;
     CudaEngineConfig    cuda_engine;
     BatchingConfig      batching;
+    CompressionConfig   compression;
+    RlmConfig           rlm;
 };
 
 // ─── [sampling] ──────────────────────────────────────────────────────────────

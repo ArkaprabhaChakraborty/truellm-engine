@@ -7,6 +7,7 @@
 #include "../plugin_bridge/plugin_bridge.h"
 
 #include <truellm/version.h>
+#include <truellm/config_schema.h>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -89,6 +90,46 @@ void NativeRouter::handle_status(const httplib::Request&, httplib::Response& res
                 {"blocks_free",       kv.blocks_free},
                 {"utilization_pct",   kv.utilization_pct},
                 {"fp8_enabled",       kv.fp8_enabled}
+            };
+        }
+    }
+
+    // Compression pipeline status — included when any stage is enabled.
+    {
+        const CompressionConfig& cc = cfg_.inference.compression;
+        bool any_enabled = cc.presis.enabled || cc.tome.enabled
+                        || cc.fastv.enabled  || cc.pyramid_drop.enabled
+                        || cc.kv_vq.enabled  || cc.kv_kivi.enabled;
+        if (any_enabled) {
+            json comp = json::object();
+            comp["presis"]       = {{"enabled", cc.presis.enabled},
+                                    {"keep_fraction", cc.presis.keep_fraction}};
+            comp["tome"]         = {{"enabled", cc.tome.enabled},
+                                    {"r", cc.tome.r}};
+            comp["fastv"]        = {{"enabled", cc.fastv.enabled},
+                                    {"start_layer", cc.fastv.start_layer},
+                                    {"keep_ratio", cc.fastv.keep_ratio}};
+            comp["pyramid_drop"] = {{"enabled", cc.pyramid_drop.enabled},
+                                    {"final_keep_ratio", cc.pyramid_drop.final_keep_ratio}};
+            comp["kv_vq"]        = {{"enabled", cc.kv_vq.enabled},
+                                    {"codebook_size", cc.kv_vq.codebook_size}};
+            comp["kv_kivi"]      = {{"enabled", cc.kv_kivi.enabled},
+                                    {"bits", cc.kv_kivi.bits},
+                                    {"residual_length", cc.kv_kivi.residual_length}};
+            body["compression"]  = comp;
+        }
+    }
+
+    // Recursive LM status — included when enabled.
+    {
+        const RlmConfig& rlm = cfg_.inference.rlm;
+        if (rlm.enabled) {
+            body["rlm"] = {
+                {"enabled",             true},
+                {"chunk_size",          rlm.chunk_size_tokens},
+                {"overlap",             rlm.chunk_overlap_tokens},
+                {"summary_tokens",      rlm.summary_tokens_per_chunk},
+                {"max_hierarchy_depth", rlm.max_hierarchy_depth}
             };
         }
     }

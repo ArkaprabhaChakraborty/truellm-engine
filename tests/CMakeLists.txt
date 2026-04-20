@@ -34,6 +34,30 @@ target_link_libraries(truellm_unit_tests
             spdlog::spdlog
 )
 
+# ---------------------------------------------------------------------------
+# CUDA-only unit tests for the compression passes.  These exercise host-side
+# logic (bounds checks, cache-mismatch guards, constructor clamps) without
+# launching any CUDA kernels, but the headers they reference include
+# <cuda_fp16.h> / <cuda_runtime.h>, so the test sources and the backend
+# library can only be linked when the CUDA backend is being built.
+# ---------------------------------------------------------------------------
+if(TRUELLM_HAS_CUDA AND TARGET truellm_backend_cuda)
+    target_sources(truellm_unit_tests PRIVATE
+        unit/inference/cuda/test_compression_scoring_pass.cpp
+        unit/inference/cuda/test_kivi_bounds.cpp
+        unit/inference/cuda/test_kivi_roundtrip.cpp
+        unit/inference/cuda/test_kv_compression_pass.cpp
+        unit/inference/cuda/test_vllm_kernels.cpp
+        unit/inference/cuda/test_vq_kernels.cpp
+        unit/inference/cuda/test_codebook_init.cpp
+    )
+    target_link_libraries(truellm_unit_tests PRIVATE
+        truellm_backend_cuda
+        truellm_vllm_kernels
+        CUDA::cudart
+    )
+endif()
+
 # Auto-discover TEST() macros so CTest shows individual test names.
 gtest_discover_tests(truellm_unit_tests)
 
@@ -55,4 +79,48 @@ if(TRUELLM_BUILD_BENCHMARKS AND TARGET benchmark::benchmark)
                 benchmark::benchmark_main
                 spdlog::spdlog
     )
+
+    # ---------------------------------------------------------------------------
+    # CUDA-specific benchmarks (megakernel vs multi-launch, sync overhead, etc.)
+    # Only built when TRUELLM_HAS_CUDA is ON.
+    # bench_smem_occupancy.cpp includes device-side headers so must be compiled
+    # as CUDA (rename to .cu handled by set_source_files_properties).
+    # ---------------------------------------------------------------------------
+    if(TRUELLM_HAS_CUDA)
+        set_source_files_properties(
+            benchmarks/bench_smem_occupancy.cpp
+            PROPERTIES LANGUAGE CUDA
+        )
+        add_executable(truellm_cuda_benchmarks
+            benchmarks/bench_megakernel_vs_multilaunch.cpp
+            benchmarks/bench_sync_overhead.cpp
+            benchmarks/bench_smem_occupancy.cpp
+            benchmarks/bench_power_efficiency.cpp
+        )
+        target_include_directories(truellm_cuda_benchmarks
+            PRIVATE ${CMAKE_SOURCE_DIR}/src/inference
+                    ${CMAKE_SOURCE_DIR}/third_party/custom_kernels/include
+        )
+        target_link_libraries(truellm_cuda_benchmarks
+            PRIVATE truellm_headers
+                    truellm_inference
+                    truellm_backend_cuda
+                    truellm_custom_kernels
+                    benchmark::benchmark
+                    benchmark::benchmark_main
+                    spdlog::spdlog
+                    CUDA::cudart
+        )
+        target_compile_definitions(truellm_cuda_benchmarks
+            PRIVATE TRUELLM_HAS_CUDA=1
+        )
+        set_target_properties(truellm_cuda_benchmarks PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+        )
+        if(TRUELLM_BENCH_NVML)
+            target_compile_definitions(truellm_cuda_benchmarks
+                PRIVATE TRUELLM_BENCH_NVML=1)
+            target_link_libraries(truellm_cuda_benchmarks PRIVATE nvidia-ml)
+        endif()
+    endif()
 endif()

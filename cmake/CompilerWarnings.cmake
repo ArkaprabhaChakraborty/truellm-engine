@@ -5,16 +5,14 @@
 add_library(truellm_warnings INTERFACE)
 
 if(MSVC)
-    target_compile_options(truellm_warnings INTERFACE
-        /W4
-        /wd4100  # unreferenced formal parameter
-        /wd4201  # nameless struct/union
-        /wd4251  # dll-interface warnings on STL members
-        /wd4275  # non-dll-interface base class
-        /permissive-
-        /utf-8   # source and execution charset UTF-8
-        /Zc:preprocessor  # conformant preprocessor (required for __VA_OPT__ etc.)
-    )
+    # NVCC does not accept bare MSVC /flag-style options; they must be wrapped
+    # with -Xcompiler= when compiling CUDA translation units.
+    foreach(_w /W4 /wd4100 /wd4201 /wd4251 /wd4275 /permissive- /utf-8 /Zc:preprocessor)
+        target_compile_options(truellm_warnings INTERFACE
+            $<$<COMPILE_LANGUAGE:CXX,C>:${_w}>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${_w}>
+        )
+    endforeach()
 else()
     target_compile_options(truellm_warnings INTERFACE
         -Wall

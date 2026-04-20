@@ -71,6 +71,32 @@ public:
     const char* vtable_get_config(const std::string& plugin_id,
                                   const std::string& key) const;
 
+    // api_minor >= 1 helpers
+    const int32_t* vtable_tokenize(const char* text, int32_t* out_count);
+    const char*    vtable_detokenize(const int32_t* tokens, int32_t count);
+    const char*    vtable_get_engine_config(const char* section, const char* key);
+    const void*    vtable_get_attention_weights(int32_t layer_idx,
+                                                int64_t* out_size_bytes);
+    const void*    vtable_get_hidden_states(int32_t layer_idx,
+                                            int64_t* out_size_bytes);
+    const void*    vtable_get_kv_cache_tensor(int32_t layer_idx, int32_t type,
+                                              int64_t out_shape[4]);
+    truellm_error_t vtable_call_engine(
+        const truellm_context_t* ctx,
+        const char* messages_json,
+        const char* gen_params_json,
+        void (*on_token)(void*, const char*, int),
+        void* cb_data,
+        char** result_json_out);
+    truellm_error_t vtable_inject_tokens(
+        truellm_context_t* ctx, int64_t pos, const char* tokens_json);
+    void        vtable_set_context_metadata(truellm_context_t* ctx,
+                                            const char* key, const char* val);
+    const char* vtable_get_context_metadata(const truellm_context_t* ctx,
+                                            const char* key);
+    const char* vtable_get_server_capability(const truellm_context_t* ctx,
+                                             const char* cap_key);
+
 private:
     // ── Subsystems ────────────────────────────────────────────────────────────
     ToolRegistry      tool_registry_;
@@ -111,6 +137,16 @@ private:
     // lifetime because we never remove entries once inserted.
     mutable std::mutex                                    config_cache_mu_;
     mutable std::unordered_map<std::string, std::string> config_cache_;
+
+    // ── api_minor >= 1 per-call scratch buffers ────────────────────────────────
+    // Reused across calls; not thread-safe — plugins must serialise these calls
+    // or accept that concurrent use may clobber the previous result.
+    mutable std::mutex           tokenize_mu_;
+    mutable std::vector<int32_t> tokenize_buf_;
+    mutable std::mutex           detokenize_mu_;
+    mutable std::string          detokenize_buf_;
+    mutable std::mutex           cap_buf_mu_;
+    mutable std::unordered_map<std::string, std::string> cap_cache_;
 
     // ── C vtable passed to native plugins ─────────────────────────────────────
     truellm_host_api_t host_vtable_{};

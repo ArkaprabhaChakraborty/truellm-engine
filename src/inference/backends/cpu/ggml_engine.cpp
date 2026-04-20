@@ -365,4 +365,58 @@ GpuStats GgmlEngine::get_gpu_stats() const
     return s;
 }
 
+// ---------------------------------------------------------------------------
+// api_minor >= 1 — compression / RLM data access
+// ---------------------------------------------------------------------------
+
+const void* GgmlEngine::get_hidden_states(int32_t layer_idx,
+                                          int64_t* out_size_bytes)
+{
+    if (out_size_bytes) *out_size_bytes = 0;
+    if (!is_model_loaded() || !ctx_) return nullptr;
+
+    // Returns the sequence-level embedding (pooled output) from the last forward
+    // pass via llama_get_embeddings(). Layer-specific hidden states require a
+    // custom llama.cpp build with intermediate tensor access — Phase C2 will
+    // add a hook if the model was compiled with LLAMA_API_EMBEDDINGS.
+    // layer_idx is recorded for future use; Phase C1 exposes the final layer only.
+    (void)layer_idx;
+    auto* lctx = ctx_->raw();
+    if (!lctx) return nullptr;
+
+    // llama_get_embeddings() returns NULL when the context was not built with
+    // embeddings enabled (LLAMA_POOLING_TYPE_NONE). If NULL, Presis will fall
+    // back to TF-IDF automatically.
+    float* emb = llama_get_embeddings(lctx);
+    if (!emb) return nullptr;
+
+    const auto* lmodel = llama_get_model(lctx);
+    int32_t n_embd = llama_model_n_embd(lmodel);
+    // n_tokens: use llama_n_seq_max() on newer llama.cpp; fall back to n_ctx.
+    int32_t n_tokens = llama_n_ctx(lctx);
+    if (out_size_bytes) *out_size_bytes = static_cast<int64_t>(n_embd) * n_tokens * sizeof(float);
+    return emb;
+}
+
+const void* GgmlEngine::get_attention_weights(int32_t layer_idx,
+                                              int64_t* out_size_bytes)
+{
+    // CPU path: llama.cpp does not expose per-layer attention weight matrices
+    // at inference time. Presis falls back to TF-IDF scoring automatically
+    // when this returns nullptr.
+    (void)layer_idx;
+    if (out_size_bytes) *out_size_bytes = 0;
+    return nullptr;
+}
+
+const void* GgmlEngine::get_kv_cache_tensor(int32_t layer_idx, int32_t type,
+                                            int64_t out_shape[4])
+{
+    // GgmlEngine uses llama.cpp's unified KV cache — no paged-block layout.
+    // VQ / KIVI GPU kernels are not applicable on the CPU path.
+    (void)layer_idx; (void)type;
+    if (out_shape) { out_shape[0]=out_shape[1]=out_shape[2]=out_shape[3]=0; }
+    return nullptr;
+}
+
 } // namespace truellm

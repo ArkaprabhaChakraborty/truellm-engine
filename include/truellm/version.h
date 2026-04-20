@@ -13,6 +13,9 @@
 
 // ABI version: plugins compiled against ABI N refuse to load on ABI N-1 / N+1
 #define TRUELLM_ABI_VERSION 1
+// Minor ABI version: additive-only extensions (new vtable entries appended).
+// Plugins may check api_minor to test for new host_api.h entries.
+#define TRUELLM_ABI_MINOR   1
 
 // Stringified version for display
 #define TRUELLM_VERSION_STRING "0.1.0"

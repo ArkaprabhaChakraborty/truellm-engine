@@ -37,6 +37,19 @@ public:
     std::string               detokenize(const std::vector<int32_t>& tokens) const override;
     GpuStats                  get_gpu_stats() const override;
 
+    // ── api_minor >= 1 — compression / RLM data access ───────────────────────
+    // get_hidden_states: uses llama_get_embeddings() to read per-token output
+    //   embeddings from the last forward pass.
+    const void* get_hidden_states(int32_t layer_idx,
+                                  int64_t* out_size_bytes) override;
+    // get_attention_weights: CPU path returns nullptr (attention weights not
+    //   saved by llama.cpp on CPU — Presis falls back to TF-IDF automatically).
+    const void* get_attention_weights(int32_t layer_idx,
+                                      int64_t* out_size_bytes) override;
+    // get_kv_cache_tensor: returns nullptr — paged KV not present on CPU path.
+    const void* get_kv_cache_tensor(int32_t layer_idx, int32_t type,
+                                    int64_t out_shape[4]) override;
+
 private:
     InferenceConfig inf_cfg_;
     HardwareConfig  hw_cfg_;

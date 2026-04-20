@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.21)
 
+# CMP0141: MSVC_DEBUG_INFORMATION_FORMAT target property support.
+# Must be set before project() so CUDA language init picks up /Z7 (embedded
+# debug info) instead of /Zi+/Fd, which NVCC mis-parses via -Xcompiler=-Fd,-FS.
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+endif()
+
 # ---------------------------------------------------------------------------
 # Version stamping (from git tag or fallback)
 # ---------------------------------------------------------------------------
