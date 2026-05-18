@@ -14,6 +14,7 @@
 #include <spdlog/spdlog.h>
 #include <toml.hpp>
 
+#include <functional>
 #include <stdexcept>
 #include <string>
 
@@ -54,6 +55,8 @@ void parse_server(const toml::value& root, ServerConfig& out)
     out.tls_enabled        = toml::find_or<bool>(t, "tls_enabled",   out.tls_enabled);
     out.tls_cert_file      = find_str(t, "tls_cert_file", out.tls_cert_file);
     out.tls_key_file       = find_str(t, "tls_key_file",  out.tls_key_file);
+    out.enable_debug_endpoints =
+        toml::find_or<bool>(t, "enable_debug_endpoints", out.enable_debug_endpoints);
 }
 
 // Parse [model]
@@ -414,6 +417,7 @@ void parse_plugins(const toml::value& root, PluginConfig& out)
                                                    out.restart_on_crash);
     out.max_restart_attempts = toml::find_or<int>(t, "max_restart_attempts",
                                                   out.max_restart_attempts);
+    out.data_dir = find_str(t, "data_dir", out.data_dir);
 
     out.tool_max_rounds = toml::find_or<int>(t, "tool_max_rounds", out.tool_max_rounds);
 
@@ -434,22 +438,47 @@ void parse_plugins(const toml::value& root, PluginConfig& out)
     out.context_split_summary_tokens      = toml::find_or<int>(t,         "context_split_summary_tokens",
                                                                 out.context_split_summary_tokens);
 
-    // Parse [plugins.settings] as a flat string-to-string map.
-    // Any non-string values are silently skipped.
+    // Parse [plugins.settings] into a flat string-to-string map.
+    //
+    // TOML expands dotted keys like
+    //     [plugins.settings]
+    //     rlm_generator.chunk_size_tokens = "512"
+    // into a sub-table:
+    //     plugins.settings -> { rlm_generator -> { chunk_size_tokens = "512" } }
+    // The previous implementation iterated only the top-level entries and
+    // silently dropped any sub-table value, so plugins read their
+    // compiled-in defaults instead of the per-plugin overrides the user
+    // configured.  We now walk the table recursively, joining keys with '.'
+    // so the trampoline's "plugin_id.key" lookup hits the correct entry.
     if (t.contains("settings")) {
         const auto& st = toml::find(t, "settings");
         if (st.is_table()) {
-            for (const auto& [k, v] : st.as_table()) {
-                if (v.is_string()) {
-                    out.settings[k] = s(v.as_string());
-                } else if (v.is_integer()) {
-                    out.settings[k] = std::to_string(v.as_integer());
-                } else if (v.is_boolean()) {
-                    out.settings[k] = v.as_boolean() ? "true" : "false";
-                } else if (v.is_floating()) {
-                    out.settings[k] = std::to_string(v.as_floating());
+            // Recursive flattener: for a leaf scalar, store
+            // `out.settings[prefix + key] = stringified value`.  For nested
+            // tables, recurse with `prefix + key + "."`.  Arrays of tables
+            // (legal in TOML but meaningless for plugin config) are skipped.
+            std::function<void(const std::string&, const decltype(st)&)> walk;
+            walk = [&](const std::string& prefix, const decltype(st)& node) {
+                if (!node.is_table()) return;
+                for (const auto& [k, v] : node.as_table()) {
+                    const std::string full = prefix.empty() ? k
+                                                            : (prefix + "." + k);
+                    if (v.is_string()) {
+                        out.settings[full] = s(v.as_string());
+                    } else if (v.is_integer()) {
+                        out.settings[full] = std::to_string(v.as_integer());
+                    } else if (v.is_boolean()) {
+                        out.settings[full] = v.as_boolean() ? "true" : "false";
+                    } else if (v.is_floating()) {
+                        out.settings[full] = std::to_string(v.as_floating());
+                    } else if (v.is_table()) {
+                        walk(full, v);
+                    }
+                    // Arrays / array-of-tables are intentionally not surfaced
+                    // — plugin settings are a flat string map by design.
                 }
-            }
+            };
+            walk("", st);
         }
     }
 }

@@ -102,7 +102,24 @@ private:
         std::promise<GenerateResult> promise;
         int64_t t_start_us = 0;  // microseconds since epoch
 
-        bool is_free() const { return seq_id == -1; }
+        // ── §4.2 — Session KV-prefix cache ─────────────────────────────────
+        // When a request supplies session_id, we retain the slot's KV cache
+        // after completion so a follow-up request sharing the same
+        // session_id can skip prefill on the matched prefix.  Warm slots
+        // are kept until either (a) the matching session returns, or (b)
+        // a fresh request needs the slot and there are no truly-free
+        // alternatives (LRU eviction).
+        bool                  warm                = false;
+        std::string           cached_session_id;
+        std::vector<int32_t>  cached_tokens;        // full prompt + generated
+        int64_t               cached_at_us        = 0;
+
+        // True iff the slot is genuinely free (no active request, no warm
+        // cache).  Preserved for the prior call-sites that don't care to
+        // distinguish warm-but-evictable from outright-free.
+        bool is_free()  const { return seq_id == -1; }
+        bool is_warm()  const { return seq_id != -1 && warm; }
+        bool is_busy()  const { return seq_id != -1 && !warm; }
     };
 
     // -----------------------------------------------------------------------
@@ -143,7 +160,8 @@ private:
     void try_admit_pending();
     void complete_slot(Slot& slot,
                        ErrorCode ec = ErrorCode::Ok,
-                       const std::string& msg = "");
+                       const std::string& msg = "",
+                       const std::string& finish_reason = "stop");
     llama_sampler* make_sampler(const GenerateRequest& req) const;
     bool           matches_stop(const Slot& slot) const;
 

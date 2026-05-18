@@ -317,6 +317,15 @@ GenerateResult GgmlEngine::generate(const GenerateRequest& req)
     result.generated_tokens = n_generated;
     result.time_ms          = static_cast<float>(
         std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count());
+    // §9.5 — surface "length" vs "stop" so plugin sub-calls can detect
+    // truncation.  This is best-effort on the CPU path because we don't
+    // distinguish EOG-from-stop-string at this point in the loop; only
+    // the n_generated==max_new branch is unambiguous "length".
+    if (result.error == ErrorCode::Ok) {
+        result.finish_reason = (n_generated >= max_new) ? "length" : "stop";
+    } else {
+        result.finish_reason = "error";
+    }
 
     float decode_ms = result.time_ms - prefill_ms;
     float tps = (decode_ms > 0 && n_generated > 0)

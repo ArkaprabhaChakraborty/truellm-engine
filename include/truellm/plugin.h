@@ -15,7 +15,7 @@ extern "C" {
 
 // ── ABI version ───────────────────────────────────────────────────────────────
 #define TRUELLM_ABI_VERSION  1u
-#define TRUELLM_ABI_MINOR    0u
+#define TRUELLM_ABI_MINOR    3u
 
 // ── Export annotation ─────────────────────────────────────────────────────────
 // TRUELLM_PLUGIN_EXPORT must decorate truellm_plugin_init in every plugin DLL.

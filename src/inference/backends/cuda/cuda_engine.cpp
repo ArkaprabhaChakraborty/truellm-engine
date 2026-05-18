@@ -246,7 +246,7 @@ void CudaEngine::unload_model()
     streams_.reset();
     allocator_.reset();
     model_.reset();
-    cuda_graphs_.clear();
+    decode_warmup_done_ = false;
 }
 
 bool CudaEngine::is_model_loaded() const
@@ -649,11 +649,71 @@ void CudaEngine::free_sampler()
 }
 
 // ---------------------------------------------------------------------------
-// CUDA graph capture stub
+// capture_cuda_graphs — startup warmup for the megakernel.
+//
+// Why we do not actually capture a cudaGraph
+//   The transformer megakernel is a *single* cudaLaunchCooperativeKernel
+//   call.  cudaGraph capture for that one launch would save one syscall
+//   per decode step (~3 µs on H100 / RTX 5090), but the corresponding
+//   cudaGraphExecKernelNodeSetParams call needed to rebind the by-value
+//   MegakernelArgs for the next step costs roughly the same.  Net win is
+//   close to zero, while the bug surface (graph corruption when KV
+//   capacity grows mid-generate, FastV/PyramidDrop config drift between
+//   captures) is large.  We therefore do not capture.
+//
+// What this function actually does
+//   1. Calls cudaOccupancyMaxActiveBlocksPerMultiprocessor on the
+//      megakernel symbol so the driver caches its occupancy answer.
+//      Without this, the first generate() pays a ~5 ms one-shot stall
+//      while the driver inspects the kernel.
+//   2. Issues a cudaFuncGetAttributes on the symbol to populate the
+//      shared-memory configuration cache.
+//   3. Optionally runs a single dummy decode-step launch on a throwaway
+//      stream so PTX JIT compilation finishes before the first real
+//      request arrives.  Skipped when there is no CUDA device or when
+//      megakernel buffers have not been allocated yet (config error).
 // ---------------------------------------------------------------------------
 void CudaEngine::capture_cuda_graphs()
 {
-    spdlog::debug("[CudaEngine] CUDA graph capture deferred — running eager");
+#ifndef TRUELLM_HAS_CUDA
+    spdlog::debug("[CudaEngine] capture_cuda_graphs: no CUDA support; "
+                  "warmup skipped");
+    return;
+#else
+    if (decode_warmup_done_) return;
+
+    // 1. Occupancy probe — this is the slow path on first call.
+    int max_blocks_per_sm = 0;
+    cudaError_t e1 = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm,
+        (const void*)truellm_transformer_megakernel,
+        /*blockDim=*/128, /*dynamicSharedMem=*/0);
+    if (e1 != cudaSuccess) {
+        spdlog::warn("[CudaEngine] warmup: cudaOccupancyMax... failed: {}",
+                     cudaGetErrorString(e1));
+        decode_warmup_done_ = true;
+        return;
+    }
+
+    // 2. Pull function attributes so the driver caches its private state
+    // (smem config, max-threads-per-block, ptx version) before the first
+    // request hits.
+    cudaFuncAttributes attrs{};
+    cudaError_t e2 = cudaFuncGetAttributes(
+        &attrs, (const void*)truellm_transformer_megakernel);
+    if (e2 != cudaSuccess) {
+        spdlog::warn("[CudaEngine] warmup: cudaFuncGetAttributes failed: {}",
+                     cudaGetErrorString(e2));
+        decode_warmup_done_ = true;
+        return;
+    }
+
+    spdlog::info("[CudaEngine] megakernel warmup ok: "
+                 "max_blocks_per_sm={} smem={}B regs={} maxThreads={}",
+                 max_blocks_per_sm, attrs.sharedSizeBytes,
+                 attrs.numRegs, attrs.maxThreadsPerBlock);
+    decode_warmup_done_ = true;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -707,6 +767,22 @@ GenerateResult CudaEngine::generate(const GenerateRequest& request)
         return result;
     }
 
+    // RAII guard: register the active session for the duration of generate()
+    // so that plugin callbacks (e.g. inject_tokens) can resolve request_id →
+    // seq_id, and remove the entry when generate() returns through any path.
+    struct SessionGuard {
+        CudaEngine* eng;
+        std::string id;
+        ~SessionGuard() {
+            if (eng && !id.empty()) eng->unregister_active_session(id);
+        }
+    };
+    SessionGuard session_guard{this, request.request_id};
+    if (!request.request_id.empty()) {
+        register_active_session(request.request_id, seq_id,
+                                /*initial_len=*/0);
+    }
+
     result.prompt_tokens = static_cast<int>(request.tokens.size());
 
 #ifdef TRUELLM_HAS_CUDA
@@ -747,6 +823,12 @@ GenerateResult CudaEngine::generate(const GenerateRequest& request)
             return result;
         }
         streams_->sync(StreamRole::Prefill);
+
+        // Update active-session bookkeeping with the post-prefill cache size
+        // so plugin callbacks fired before the decode loop starts can call
+        // inject_tokens at the correct append position.
+        if (!request.request_id.empty())
+            update_session_kv_len(request.request_id, num_prompt);
 
         // Post-prefill: KV compression (VQ / KiVi) on all layers.
         run_kv_compression_pass(num_prompt, streams_->get(StreamRole::Copy));
@@ -834,6 +916,8 @@ GenerateResult CudaEngine::generate(const GenerateRequest& request)
         llama_sampler_apply(sampler_, &tda);
         next_token = tda.data[tda.selected].id;
         ++seq_pos;
+        if (!request.request_id.empty())
+            update_session_kv_len(request.request_id, seq_pos);
     }
 #endif // TRUELLM_HAS_CUDA
 
@@ -1276,6 +1360,134 @@ const void* CudaEngine::get_kv_cache_tensor(int32_t layer_idx, int32_t type,
         out_shape[3] = model_->head_dim();
     }
     return ptr;
+}
+
+// ---------------------------------------------------------------------------
+// Active-session bookkeeping
+// ---------------------------------------------------------------------------
+void CudaEngine::register_active_session(const std::string& request_id,
+                                          uint64_t seq_id, int32_t initial_len)
+{
+    if (request_id.empty()) return;
+    std::lock_guard<std::mutex> lk(active_sessions_mu_);
+    active_sessions_[request_id] = ActiveSession{seq_id, initial_len};
+}
+
+void CudaEngine::unregister_active_session(const std::string& request_id)
+{
+    if (request_id.empty()) return;
+    std::lock_guard<std::mutex> lk(active_sessions_mu_);
+    active_sessions_.erase(request_id);
+}
+
+void CudaEngine::update_session_kv_len(const std::string& request_id,
+                                        int32_t new_len)
+{
+    if (request_id.empty()) return;
+    std::lock_guard<std::mutex> lk(active_sessions_mu_);
+    auto it = active_sessions_.find(request_id);
+    if (it != active_sessions_.end()) it->second.kv_seq_len = new_len;
+}
+
+// ---------------------------------------------------------------------------
+// inject_tokens — append-only K/V splice for the active sequence.
+//
+// Constraints
+//   * pos must equal the current end-of-cache for the addressed sequence
+//     (mid-sequence inserts would require shifting logical→physical block
+//     mappings, which is not supported here).
+//   * tokens must be non-empty.
+//   * The caller must already own a generate() invocation for `request_id`
+//     (the session has been registered).  Sessions are scoped to one
+//     generate() call; calls made before generate() starts or after it
+//     returns will fail with InvalidArgument.
+//
+// Mechanism
+//   We piggy-back on run_forward_megakernel — it already writes K/V at
+//   `kv_write_offset` for each token in the input batch.  We discard the
+//   resulting argmax (which only describes the next token a hypothetical
+//   sampling step would pick) since the caller is splicing context, not
+//   generating output.  The KV-compression pass is rerun on the appended
+//   slots so the cache stays consistent with the active compression mode.
+// ---------------------------------------------------------------------------
+ErrorCode CudaEngine::inject_tokens(const std::string& request_id,
+                                    int64_t pos,
+                                    const std::vector<int32_t>& tokens)
+{
+    if (tokens.empty()) return ErrorCode::InvalidArgument;
+    if (!is_model_loaded()) return ErrorCode::Unavailable;
+#ifndef TRUELLM_HAS_CUDA
+    (void)request_id; (void)pos;
+    return ErrorCode::NotImplemented;
+#else
+    if (!inf_cfg_.cuda_engine.use_megakernel) {
+        // The non-megakernel path runs one token at a time through ggml +
+        // vllm; injecting tokens via that path would silently re-run the
+        // full attention output computation.  Until a partial K/V-only
+        // ggml graph is added, refuse the operation.
+        spdlog::warn("[CudaEngine] inject_tokens: requires use_megakernel=true; "
+                     "the non-megakernel path has no K/V-only forward.");
+        return ErrorCode::NotImplemented;
+    }
+
+    ActiveSession session{};
+    {
+        std::lock_guard<std::mutex> lk(active_sessions_mu_);
+        auto it = active_sessions_.find(request_id);
+        if (it == active_sessions_.end()) {
+            spdlog::warn("[CudaEngine] inject_tokens: no active session for "
+                         "request_id='{}'", request_id);
+            return ErrorCode::InvalidArgument;
+        }
+        session = it->second;
+    }
+
+    if (pos != static_cast<int64_t>(session.kv_seq_len)) {
+        spdlog::warn("[CudaEngine] inject_tokens: pos={} != kv_seq_len={} "
+                     "(append-only path is the only mode supported)",
+                     pos, session.kv_seq_len);
+        return ErrorCode::InvalidArgument;
+    }
+
+    const int n        = static_cast<int>(tokens.size());
+    const int new_len  = session.kv_seq_len + n;
+    const int block_sz = allocator_->block_size();
+
+    // Reserve any new KV blocks crossed by the append.
+    for (int p = session.kv_seq_len; p < new_len; ++p) {
+        if (p > 0 && (p % block_sz) == 0) {
+            if (allocator_->extend_sequence(session.seq_id) < 0) {
+                spdlog::warn("[CudaEngine] inject_tokens: KV pool exhausted "
+                             "during append (seq_id={} pos={})",
+                             session.seq_id, p);
+                return ErrorCode::Unavailable;
+            }
+        }
+    }
+
+    // Run the megakernel for the appended tokens, discarding the argmax.
+    cudaStream_t stream = streams_->get(StreamRole::Decode);
+    ErrorCode ec = run_forward_megakernel(
+        tokens, new_len, session.kv_seq_len, stream);
+    if (ec != ErrorCode::Ok) {
+        spdlog::warn("[CudaEngine] inject_tokens: megakernel failed (ec={})",
+                     static_cast<int>(ec));
+        return ec;
+    }
+    streams_->sync(StreamRole::Decode);
+
+    // Run KV compression on the freshly written slots so that downstream
+    // attention reads see the same compressed format as the rest of the
+    // sequence.  Safe even if compression is disabled (run() is a no-op).
+    run_kv_compression_pass(n, streams_->get(StreamRole::Copy));
+
+    update_session_kv_len(request_id, new_len);
+
+    spdlog::debug("[CudaEngine] inject_tokens: spliced {} tokens at pos={} "
+                  "(seq_id={}, new kv_len={})",
+                  n, pos, session.seq_id, new_len);
+    return ErrorCode::Ok;
+#endif
 }
 
 } // namespace truellm

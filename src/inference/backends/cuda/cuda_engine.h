@@ -26,7 +26,7 @@
 #include "compression/kv_compression_pass.h"
 #include "compression/compression_scoring_pass.h"
 
-#include <cuda_fp16.h>  
+#include <cuda_fp16.h>
 #include <llama.h>      // llama_sampler_chain_*
 #include <ggml.h>       // ggml_tensor, ggml_context
 #include <ggml-alloc.h> // ggml_gallocr_t
@@ -34,7 +34,9 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace truellm {
@@ -82,6 +84,12 @@ public:
     const void* get_kv_cache_tensor(int32_t layer_idx, int32_t type,
                                     int64_t out_shape[4]) override;
 
+    // Append-only token injection for the active sequence identified by
+    // request_id.  See EngineInterface::inject_tokens for full contract.
+    ErrorCode inject_tokens(const std::string& request_id,
+                            int64_t pos,
+                            const std::vector<int32_t>& tokens) override;
+
 private:
     // Config (owned)
     InferenceConfig  inf_cfg_;
@@ -122,12 +130,35 @@ private:
     // Host-side logits buffer — filled by run_forward, read by generate()
     std::vector<float> d_logits_buf_;
 
-    // CUDA graph cache (decode step, one graph per batch size)
-    struct GraphEntry { int batch_size; void* graph_exec; };
-    std::vector<GraphEntry> cuda_graphs_;
+    // ── CUDA-graph state ──────────────────────────────────────────────────────
+    // Architecturally the megakernel is a single cooperative launch — the
+    // savings from cudaGraph capture (one launch syscall replaced) are
+    // close to the cost of cudaGraphExecKernelNodeSetParams per step.  We
+    // therefore use the post-load warmup path to JIT-prime the kernel and
+    // populate the occupancy cache; any future capture work would extend
+    // the GraphEntry table.  decode_warmup_done_ guards the warmup so it
+    // runs exactly once per process.
+    bool   decode_warmup_done_  = false;
 
     // Request counter for seq_id generation
     std::atomic<uint64_t> next_seq_id_{1};
+
+    // ── Active session table (request_id ↔ seq_id) ───────────────────────────
+    // Populated on entry to generate(); removed on exit.  Plugin callbacks
+    // fired between forward passes (e.g. inject_tokens for KV-splice
+    // generators) look the seq_id up here using ctx->request_id.
+    struct ActiveSession {
+        uint64_t seq_id;
+        int32_t  kv_seq_len;   // current end-of-cache for this sequence
+    };
+    mutable std::mutex                              active_sessions_mu_;
+    std::unordered_map<std::string, ActiveSession>  active_sessions_;
+
+    void register_active_session  (const std::string& request_id,
+                                   uint64_t seq_id, int32_t initial_len);
+    void unregister_active_session(const std::string& request_id);
+    void update_session_kv_len    (const std::string& request_id,
+                                   int32_t new_len);
 
     // ── Compression passes (created in load_model when enabled) ─────────────
     std::unique_ptr<KvCompressionPass>      kv_compress_;
@@ -209,7 +240,10 @@ private:
     std::vector<int32_t> run_scoring_pass(const std::vector<int32_t>& tokens,
                                           int kv_seq);
 
-    // CUDA graph capture (called after model load when !enforce_eager)
+    // Post-load warmup: prime the megakernel JIT cache and the occupancy
+    // computer so the first real decode step does not stall.  No-op when
+    // enforce_eager=true is set (the warmup writes to the activation
+    // buffer; in eager mode we skip it to keep startup observable).
     void capture_cuda_graphs();
 };
 

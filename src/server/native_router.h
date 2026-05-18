@@ -32,8 +32,13 @@ private:
     std::chrono::steady_clock::time_point start_time_ =
         std::chrono::steady_clock::now();
 
-    void handle_status (const httplib::Request&, httplib::Response&);
-    void handle_plugins(const httplib::Request&, httplib::Response&);
+    void handle_status       (const httplib::Request&, httplib::Response&);
+    void handle_plugins      (const httplib::Request&, httplib::Response&);
+    void handle_rlm_status   (const httplib::Request&, httplib::Response&);
+    void handle_compression_status(const httplib::Request&, httplib::Response&);
+    void handle_chat_status  (const httplib::Request&, httplib::Response&);
+    void handle_research_status(const httplib::Request&, httplib::Response&);
+    void handle_tools_dispatch(const httplib::Request&, httplib::Response&);
 };
 
 } // namespace truellm

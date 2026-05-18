@@ -76,6 +76,22 @@ struct GenerateRequest {
 
     // Stop sequences (strings) — per-request, merged with SamplingConfig::stop
     std::vector<std::string> stop;
+
+    // Optional request id used for active-session tracking.  Backends that
+    // implement inject_tokens key their request_id → seq_id map on this
+    // value.  Empty string → no session tracking (the backend still works,
+    // it just cannot service inject_tokens calls naming this request).
+    std::string          request_id;
+
+    // Optional session id for cross-request KV-cache prefix reuse
+    // (Code_Capability_design.md §4.2).  When non-empty and the
+    // scheduler's kv-prefix cache is enabled, two requests sharing the
+    // same session_id and a common token prefix reuse the prefilled KV
+    // cache from the first request — the second request only prefills
+    // the tail tokens.  Strict perf optimisation; semantically the
+    // request is identical whether or not reuse fires.  Empty string =
+    // no reuse, normal scheduler behaviour.
+    std::string          session_id;
 };
 
 // ---------------------------------------------------------------------------
@@ -89,6 +105,11 @@ struct GenerateResult {
     float                time_ms;         // total generation time
     ErrorCode            error = ErrorCode::Ok;
     std::string          error_message;
+    // "stop" | "length" | "error" — set by the scheduler / engine when
+    // generation terminates.  Code_Capability_design.md §9.5: surfaced
+    // back to plugins through vtable_call_engine's result_json so the
+    // research_synthesizer can detect length-truncation and resume.
+    std::string          finish_reason = "stop";
 };
 
 // ---------------------------------------------------------------------------
@@ -164,6 +185,42 @@ public:
         (void)layer_idx; (void)type;
         if (out_shape) { out_shape[0] = out_shape[1] = out_shape[2] = out_shape[3] = 0; }
         return nullptr;
+    }
+
+    // Insert token IDs into the active request's KV cache at a given logical
+    // position.  Used by RLM / compression plugins to splice summary tokens
+    // into the running context without re-tokenising the entire message.
+    //
+    // request_id : matches ctx->request_id of the in-flight generate() call;
+    //              the engine maps this to the underlying seq_id of the paged
+    //              KV cache.
+    // pos        : logical position in the sequence.  For append-only mode
+    //              (the only mode CudaEngine currently supports), pos must
+    //              equal the current end of the sequence's cached tokens.
+    // tokens     : the IDs to project K/V for and write into the cache.
+    //
+    // Returns:
+    //   ErrorCode::Ok                on success
+    //   ErrorCode::InvalidArgument   if request_id has no active session,
+    //                                pos != current length (non-append),
+    //                                or tokens is empty
+    //   ErrorCode::Unavailable       if the KV pool cannot accommodate the
+    //                                additional slots
+    //   ErrorCode::NotImplemented    if the backend has no insertion primitive
+    //                                (the GgmlEngine CPU backend reports this)
+    //
+    // Implementation contract
+    //   Backends that support inject_tokens must call register_active_session
+    //   on entry to generate() and unregister_active_session on exit so that
+    //   plugin callbacks fired between forward passes can see the live
+    //   seq_id.  The append-only restriction sidesteps the need to shift
+    //   logical-to-physical block maps for mid-sequence inserts (a future
+    //   extension).
+    virtual ErrorCode inject_tokens(const std::string& request_id,
+                                    int64_t pos,
+                                    const std::vector<int32_t>& tokens) {
+        (void)request_id; (void)pos; (void)tokens;
+        return ErrorCode::NotImplemented;
     }
 };
 

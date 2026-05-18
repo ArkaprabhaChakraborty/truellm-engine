@@ -26,6 +26,10 @@ struct ServerConfig {
     bool        tls_enabled         = false;
     std::string tls_cert_file       = "";
     std::string tls_key_file        = "";
+    // Debug-only routes (POST /truellm/v1/tools/dispatch).  Off by
+    // default for production safety; integration test configs flip
+    // this on so tests can drive plugin tool surfaces directly.
+    bool        enable_debug_endpoints = false;
 };
 
 // ─── [model] ─────────────────────────────────────────────────────────────────
@@ -297,6 +301,12 @@ struct PluginConfig {
     int                      sidecar_timeout_ms   = 5000;
     bool                     restart_on_crash     = true;
     int                      max_restart_attempts = 3;
+
+    // Sandboxed per-plugin data directory.  Each plugin sees only
+    // ${data_dir}/<plugin_id>/.  Empty disables the host fs API entirely
+    // (host->plugin_data_dir returns NULL, host->plugin_fs_* returns
+    // TRUELLM_ERR_PERMISSION).  Default: ${cwd}/build/plugin-data.
+    std::string              data_dir             = "";
 
     // ── Tool dispatch ─────────────────────────────────────────────────────────
     // tool_max_rounds — maximum tool-call / dispatch iterations per request

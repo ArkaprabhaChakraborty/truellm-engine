@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 #include "openai_router.h"
+#include "chat_template.h"
 #include "../inference/engine_interface.h"
 #include "../plugin_bridge/plugin_bridge.h"
 
@@ -13,6 +14,7 @@
 #include <cctype>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -79,24 +81,14 @@ static std::string sanitize_utf8(const std::string& s)
 //   "phi3"           → Microsoft Phi-3 / Phi-3.5
 //   anything else    → fall back to ChatML (Qwen, Mistral-v0.3+, etc.)
 // ---------------------------------------------------------------------------
-static std::string resolve_template(const std::string& cfg_hint,
-                                    const std::string& arch)
-{
-    if (cfg_hint != "auto") return cfg_hint;
-
-    // Lowercase arch for case-insensitive matching
-    std::string a = arch;
-    for (char& c : a) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-    if (a.rfind("llama", 0) == 0 || a == "mistral")
-        return "llama3";
-    if (a.rfind("gemma", 0) == 0)
-        return "gemma";
-    if (a.rfind("phi3",  0) == 0 || a == "phi-3")
-        return "phi3";
-    // Qwen, qwen2, deepseek, yi, baichuan, etc. — all use ChatML
-    return "chatml";
-}
+// resolve_template / apply_chat_template / resolve_message_content live in
+// "chat_template.h" so plugin_bridge can apply the same templating logic to
+// the messages_json that arrives from host->call_engine() sub-calls.  The
+// originals here have been replaced with thin file-local aliases that keep
+// the existing call-sites in this translation unit working unchanged.
+using ::truellm::resolve_template;
+using ::truellm::resolve_message_content;
+using ::truellm::apply_chat_template;
 
 // ---------------------------------------------------------------------------
 // tool_args_string — extract the "arguments" field from a tool_calls entry
@@ -115,112 +107,7 @@ static std::string tool_args_string(const json& call)
     return "{}";
 }
 
-// ---------------------------------------------------------------------------
-// resolve_message_content — returns the text content to embed in the prompt
-// for a given message object.
-//
-// For assistant messages that carry tool_calls but no text content (the common
-// case after parse_tool_calls() succeeds), we serialise the tool_calls array
-// back to JSON so the rebuilt multi-turn prompt reflects what the model said.
-// Without this, the assistant turn in the rebuilt context is blank, which
-// confuses the model on the second inference pass.
-// ---------------------------------------------------------------------------
-static std::string resolve_message_content(const json& msg)
-{
-    std::string content = msg.value("content", "");
-    if (content.empty()
-        && msg.value("role", "") == "assistant"
-        && msg.contains("tool_calls")
-        && msg["tool_calls"].is_array()
-        && !msg["tool_calls"].empty())
-    {
-        // Serialise as {"tool_calls":[...]} so parse_tool_calls() can re-parse
-        // it if the loop ever needs to re-evaluate the same turn.
-        content = json{{"tool_calls", msg["tool_calls"]}}.dump();
-    }
-    return content;
-}
-
-// ---------------------------------------------------------------------------
-// apply_chat_template — build a single prompt string from a messages array.
-//
-// Template-specific notes:
-//   llama3  — LLaMA 3 / LLaMA 3.1 instruct (Nemotron, Meta-Llama-3-*)
-//               "tool" role is natively supported as a separate header turn.
-//   gemma   — Gemma 2 / Gemma 3 (Google).
-//               Only "user" and "model" roles exist.  "assistant" is mapped
-//               to "model"; "tool" results are wrapped as a "user" turn with
-//               a [Tool result] prefix.
-//   phi3    — Phi-3 / Phi-3.5 (Microsoft).
-//               <|role|>\ncontent<|end|>\n.  Supports "system", "user",
-//               "assistant", and "tool" natively via angle-bracket role tags.
-//   chatml  — ChatML (Qwen, Mistral-instruct-v0.3+, etc.).
-//               <|im_start|>role\ncontent<|im_end|>\n.  "tool" is a valid
-//               role for Qwen2+ and compatible ChatML models.
-// ---------------------------------------------------------------------------
-static std::string apply_chat_template(const json& messages,
-                                       const std::string& tmpl_hint)
-{
-    // BOS token is NOT embedded in the prompt string.
-    // llama_tokenize is called with add_special=true, which inserts the model's
-    // BOS token (from GGUF tokenizer metadata) at position 0 automatically.
-    // For LLaMA 3: BOS = <|begin_of_text|> (128000), add_eos = false in GGUF.
-    // For Gemma:   BOS = <bos>,              add_eos = false.
-    // For ChatML:  BOS varies per model,     add_eos = false typically.
-    // Embedding BOS explicitly in the string AND using add_special=true would
-    // produce a double-BOS sequence (128000 at positions 0 and 1), which causes
-    // the model to generate EOS as its very first output token.
-
-    std::string prompt;
-    for (const auto& msg : messages) {
-        const std::string role    = msg.value("role", "user");
-        const std::string content = resolve_message_content(msg);
-
-        if (tmpl_hint == "llama3") {
-            // LLaMA 3 natively supports "system", "user", "assistant", "tool".
-            prompt += "<|start_header_id|>" + role + "<|end_header_id|>\n\n";
-            prompt += content + "<|eot_id|>";
-
-        } else if (tmpl_hint == "gemma") {
-            // Gemma only knows "user" and "model".
-            std::string gemma_role;
-            std::string gemma_content = content;
-            if (role == "assistant") {
-                gemma_role = "model";
-            } else if (role == "tool") {
-                // Wrap tool results as a user turn; prefix makes them identifiable.
-                gemma_role    = "user";
-                gemma_content = "[Tool result]\n" + content;
-            } else {
-                gemma_role = role;  // "user" / "system" (treated as user by Gemma)
-            }
-            prompt += "<start_of_turn>" + gemma_role + "\n"
-                    + gemma_content + "<end_of_turn>\n";
-
-        } else if (tmpl_hint == "phi3") {
-            // Phi-3: <|role|>\ncontent<|end|>\n
-            // Phi-3 natively supports <|tool|> for tool results.
-            prompt += "<|" + role + "|>\n" + content + "<|end|>\n";
-
-        } else {
-            // ChatML (default for "auto", "chatml", and unknown values).
-            // "tool" is a valid ChatML role for Qwen2+ and compatible models.
-            prompt += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
-        }
-    }
-
-    // Open the assistant turn — model fills in from here.
-    if (tmpl_hint == "llama3") {
-        prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n";
-    } else if (tmpl_hint == "gemma") {
-        prompt += "<start_of_turn>model\n";
-    } else if (tmpl_hint == "phi3") {
-        prompt += "<|assistant|>\n";
-    } else {
-        prompt += "<|im_start|>assistant\n";
-    }
-    return prompt;
-}
+// resolve_message_content + apply_chat_template moved to "chat_template.h"
 
 // ---------------------------------------------------------------------------
 // Context splitter helpers
@@ -351,6 +238,32 @@ void OpenAIRouter::register_routes(httplib::Server& svr, AuthCheck auth)
             if (!auth(req, res)) return;
             handle_chat_completions(req, res);
         });
+
+    // §9.4 — /v1/research alias.  Thin wrapper that forces
+    // truellm_metadata.mode = "research" before delegating to the chat
+    // completions handler so the research_orchestrator generator picks
+    // the request up.  Clients can still set effort / session.id through
+    // the existing metadata channels.
+    svr.Post("/v1/research",
+        [this, auth](const httplib::Request& req, httplib::Response& res) {
+            if (!auth(req, res)) return;
+            // Cheap trick: parse, mutate, replace req body in-place.
+            // httplib's Request.body is non-const, so we can rewrite it.
+            // If the body isn't valid JSON, fall through; the chat handler
+            // will surface the parse error to the caller with the same
+            // shape as a direct /v1/chat/completions call.
+            auto& mutable_req = const_cast<httplib::Request&>(req);
+            json body = json::parse(mutable_req.body, nullptr, false);
+            if (body.is_object()) {
+                if (!body.contains("truellm_metadata") || !body["truellm_metadata"].is_object())
+                    body["truellm_metadata"] = json::object();
+                body["truellm_metadata"]["mode"] = "research";
+                if (!body["truellm_metadata"].contains("effort"))
+                    body["truellm_metadata"]["effort"] = "medium";
+                mutable_req.body = body.dump();
+            }
+            handle_chat_completions(req, res);
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +286,7 @@ static std::string trace_json(const json& j, std::size_t max_chars = 256)
 //   4. OpenAI call obj:  {"function":{"name":"fn","arguments":{...}}}
 //   5. LLaMA 3.1 tag:    <|python_tag|>{"name":"fn","parameters":{...}}
 //   6. JSON in <tool_call>...</tool_call> tags
+//   7. Tool shorthand:   {"tool":"fn","parameters":{...}}
 //
 // Returns an empty array if no tool calls are found.
 // ---------------------------------------------------------------------------
@@ -384,6 +298,11 @@ static json normalise_single_call(const json& j)
 
     if (j.contains("name")) {
         name = j.value("name", "");
+        args = j.contains("arguments")  ? j["arguments"]
+             : j.contains("parameters") ? j["parameters"]
+             : json::object();
+    } else if (j.contains("tool")) {
+        name = j.value("tool", "");
         args = j.contains("arguments")  ? j["arguments"]
              : j.contains("parameters") ? j["parameters"]
              : json::object();
@@ -538,6 +457,137 @@ static std::unique_ptr<truellm_context_t> make_context(
 }
 
 // ---------------------------------------------------------------------------
+// is_tool_allowed — enforce agent.allowed_tools (Code_Capability_design.md
+// §3.3.2 plan_mode_guard).  When the CSV is empty / absent, every tool is
+// allowed.  When non-empty, accept a tool call iff its qualified name OR
+// its short (post-dot) form is on the list.  The match is whitespace-
+// trimmed but case-sensitive — tool names are [a-z0-9_]+, not user prose.
+// ---------------------------------------------------------------------------
+static bool is_tool_allowed(const std::string& qname,
+                            const std::string& allow_csv)
+{
+    if (allow_csv.empty()) return true;
+    const std::string short_name =
+        qname.find('.') == std::string::npos ? qname
+                                              : qname.substr(qname.find('.') + 1);
+    size_t pos = 0;
+    while (pos < allow_csv.size()) {
+        size_t end = allow_csv.find(',', pos);
+        if (end == std::string::npos) end = allow_csv.size();
+        size_t a = allow_csv.find_first_not_of(" \t", pos);
+        if (a < end) {
+            size_t b = allow_csv.find_last_not_of(" \t", end - 1);
+            std::string tok = allow_csv.substr(a, b - a + 1);
+            if (tok == qname || tok == short_name) return true;
+            // wildcard form "plugin.*" matches every tool under a plugin
+            if (!tok.empty() && tok.back() == '*' && tok.size() >= 2
+                && tok[tok.size() - 2] == '.')
+            {
+                const std::string prefix = tok.substr(0, tok.size() - 1);
+                if (qname.rfind(prefix, 0) == 0) return true;
+            }
+        }
+        pos = end + 1;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// merge_subcall_usage — Code_Capability_design.md §9.6.
+// Read the per-request sub-call usage counters that vtable_call_engine
+// accumulates on ctx.metadata and merge them into the OpenAI-style usage
+// object the response builder is about to emit.  Returns the input
+// `usage` json modified in-place.  Safe to call with ctx == nullptr.
+// ---------------------------------------------------------------------------
+static void merge_subcall_usage(nlohmann::json& usage,
+                                const truellm_context_t* ctx)
+{
+    if (!ctx) return;
+    int64_t sub_prompt = 0, sub_completion = 0, sub_count = 0;
+    {
+        std::lock_guard<std::mutex> lk(ctx->metadata_mu);
+        auto pull = [&](const char* k) -> int64_t {
+            auto it = ctx->metadata.find(k);
+            if (it == ctx->metadata.end()) return 0;
+            try { return std::stoll(it->second); } catch (...) { return 0; }
+        };
+        sub_prompt     = pull("research.subcall_prompt_tokens");
+        sub_completion = pull("research.subcall_completion_tokens");
+        sub_count      = pull("research.subcall_count");
+    }
+    if (sub_count <= 0) return;
+    usage["research_prompt_tokens"]     = sub_prompt;
+    usage["research_completion_tokens"] = sub_completion;
+    usage["research_total_tokens"]      = sub_prompt + sub_completion;
+    usage["research_subcall_count"]     = sub_count;
+}
+
+// ---------------------------------------------------------------------------
+// format_tool_denial — Code_Capability_design.md §4.5.
+// Build the role-`tool` message body used when a tool call is refused
+// (either by the agent.allowed_tools allow-list, or because the plugin
+// itself returned TRUELLM_ERR_PERMISSION).  Returning structured JSON
+// instead of free text lets the model parse the result deterministically.
+// ---------------------------------------------------------------------------
+static std::string format_tool_denial(const std::string& reason)
+{
+    return nlohmann::json{
+        {"denied", true},
+        {"reason", reason}
+    }.dump();
+}
+
+// ---------------------------------------------------------------------------
+// absorb_client_metadata — copy per-request metadata from well-known HTTP
+// fields into ctx->metadata so that opt-in flags like "rlm_eligible"
+// reach the plugin layer.  Three channels are supported, matching the
+// integration test harness:
+//   1. JSON body:   extra_body.truellm.context_metadata  (object of strings)
+//   2. JSON body:   truellm_metadata                     (object of strings)
+//   3. HTTP header: x-truellm-context-metadata           (JSON object string)
+//
+// Non-string values are JSON-stringified so the metadata map is always
+// std::string → std::string.  Invalid JSON in any channel is ignored
+// without failing the request.
+// ---------------------------------------------------------------------------
+static void absorb_client_metadata(truellm_context_t* ctx,
+                                   const nlohmann::json& body,
+                                   const httplib::Request& req)
+{
+    if (!ctx) return;
+
+    auto merge_object = [&](const nlohmann::json& obj) {
+        if (!obj.is_object()) return;
+        std::lock_guard<std::mutex> lk(ctx->metadata_mu);
+        for (auto it = obj.begin(); it != obj.end(); ++it) {
+            if (it.value().is_string()) {
+                ctx->metadata[it.key()] = it.value().get<std::string>();
+            } else {
+                ctx->metadata[it.key()] = it.value().dump();
+            }
+        }
+    };
+
+    // Channel 1: extra_body.truellm.context_metadata
+    if (body.contains("extra_body") && body["extra_body"].is_object()) {
+        const auto& eb = body["extra_body"];
+        if (eb.contains("truellm") && eb["truellm"].is_object()) {
+            const auto& tl = eb["truellm"];
+            if (tl.contains("context_metadata")) merge_object(tl["context_metadata"]);
+        }
+    }
+    // Channel 2: truellm_metadata at root
+    if (body.contains("truellm_metadata")) merge_object(body["truellm_metadata"]);
+
+    // Channel 3: header (JSON object string)
+    const auto hv = req.get_header_value("x-truellm-context-metadata");
+    if (!hv.empty()) {
+        auto parsed = nlohmann::json::parse(hv, nullptr, false);
+        if (!parsed.is_discarded()) merge_object(parsed);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GET /v1/models
 // ---------------------------------------------------------------------------
 void OpenAIRouter::handle_models(const httplib::Request&, httplib::Response& res)
@@ -612,12 +662,15 @@ void OpenAIRouter::handle_completions(const httplib::Request& req,
     }
 
     std::string req_id   = "cmpl-" + std::to_string(unix_now());
+    greq.request_id      = req_id;
     std::string model_id = cfg_.model.alias.empty() ? "default" : cfg_.model.alias;
 
     // ── Build per-request plugin context ──────────────────────────────────────
     std::unique_ptr<truellm_context_t> ctx;
     if (plugin_bridge_) {
         ctx = make_context(cfg_, engine_, max_tokens, temperature);
+        ctx->request_id = req_id;
+        absorb_client_metadata(ctx.get(), body, req);
     }
 
     // ── Preprocessor chain ────────────────────────────────────────────────────
@@ -732,11 +785,40 @@ void OpenAIRouter::handle_completions(const httplib::Request& req,
                 std::string args    = tool_args_string(call);
                 std::string call_id = call.value("id", "call_" + std::to_string(tool_round));
 
+                // Allow-list enforcement (§3.3.2).  Refuse before dispatch when
+                // the call is not in agent.allowed_tools.
+                std::string allow_csv;
+                if (ctx) {
+                    std::lock_guard<std::mutex> lk(ctx->metadata_mu);
+                    auto it = ctx->metadata.find("agent.allowed_tools");
+                    if (it != ctx->metadata.end()) allow_csv = it->second;
+                }
+                if (!is_tool_allowed(qname, allow_csv)) {
+                    spdlog::info("[OpenAI/completions] tool '{}' refused by "
+                                 "agent.allowed_tools (scope={})",
+                                 qname, allow_csv.empty() ? "(none)" : allow_csv);
+                    tool_results_block += "\n[Tool " + call_id + " result]: " +
+                        format_tool_denial(
+                            "tool '" + qname + "' is not in the allow-list "
+                            "(agent.allowed_tools)") + "\n";
+                    continue;
+                }
+
                 spdlog::debug("[OpenAI] dispatching tool '{}'  args_len={}", qname, args.size());
                 ToolCallResult tc = plugin_bridge_->dispatch_tool(qname, args, ctx.get());
 
-                tool_results_block += "\n[Tool " + call_id + " result]: " +
-                    (tc.error == TRUELLM_OK ? tc.payload : "[Tool error] " + tc.error_msg) + "\n";
+                std::string body;
+                if (tc.error == TRUELLM_OK) {
+                    body = tc.payload;
+                } else if (tc.error == TRUELLM_ERR_PERMISSION) {
+                    body = format_tool_denial(
+                        tc.error_msg.empty()
+                            ? std::string("tool refused the request")
+                            : tc.error_msg);
+                } else {
+                    body = "[Tool error] " + tc.error_msg;
+                }
+                tool_results_block += "\n[Tool " + call_id + " result]: " + body + "\n";
             }
 
             // Append results and regenerate.
@@ -757,6 +839,12 @@ void OpenAIRouter::handle_completions(const httplib::Request& req,
                       result.text.size() > 256
                           ? result.text.substr(0, 256) + "..." : result.text);
 
+        json usage = {
+            {"prompt_tokens",     result.prompt_tokens},
+            {"completion_tokens", result.generated_tokens},
+            {"total_tokens",      result.prompt_tokens + result.generated_tokens}
+        };
+        merge_subcall_usage(usage, ctx.get());
         json resp = {
             {"id",      req_id},
             {"object",  "text_completion"},
@@ -765,13 +853,10 @@ void OpenAIRouter::handle_completions(const httplib::Request& req,
             {"choices", json::array({
                 {{"text",          result.text},
                  {"index",         0},
-                 {"finish_reason", "stop"}}
+                 {"finish_reason", result.finish_reason.empty()
+                                      ? "stop" : result.finish_reason}}
             })},
-            {"usage", {
-                {"prompt_tokens",     result.prompt_tokens},
-                {"completion_tokens", result.generated_tokens},
-                {"total_tokens",      result.prompt_tokens + result.generated_tokens}
-            }}
+            {"usage",   usage}
         };
         res.set_content(resp.dump(), "application/json");
     }
@@ -840,12 +925,75 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
 
     std::string req_id   = "chatcmpl-" + std::to_string(unix_now());
     std::string model_id = cfg_.model.alias.empty() ? "default" : cfg_.model.alias;
+    greq.request_id      = req_id;
+    // §4.2 — surface the client's session.id (when supplied) to the
+    // scheduler so KV-prefix reuse can fire across turns of the same
+    // chat session.  We resolve it from the body / header channels
+    // BEFORE absorb_client_metadata so the value is available even
+    // when ctx isn't built yet (plugin_bridge_ might be off).
+    {
+        auto pick_sid = [&]() -> std::string {
+            try {
+                if (body.contains("truellm_metadata")
+                    && body["truellm_metadata"].is_object()
+                    && body["truellm_metadata"].contains("session.id")
+                    && body["truellm_metadata"]["session.id"].is_string())
+                    return body["truellm_metadata"]["session.id"].get<std::string>();
+                if (body.contains("extra_body")
+                    && body["extra_body"].is_object()
+                    && body["extra_body"].contains("truellm")
+                    && body["extra_body"]["truellm"].is_object()
+                    && body["extra_body"]["truellm"].contains("context_metadata")
+                    && body["extra_body"]["truellm"]["context_metadata"].is_object())
+                {
+                    const auto& cm = body["extra_body"]["truellm"]["context_metadata"];
+                    if (cm.contains("session.id") && cm["session.id"].is_string())
+                        return cm["session.id"].get<std::string>();
+                }
+            } catch (...) {}
+            const auto hdr = req.get_header_value("x-truellm-context-metadata");
+            if (!hdr.empty()) {
+                try {
+                    auto j = json::parse(hdr);
+                    if (j.is_object() && j.contains("session.id")
+                        && j["session.id"].is_string())
+                        return j["session.id"].get<std::string>();
+                } catch (...) {}
+            }
+            return {};
+        };
+        greq.session_id = pick_sid();
+    }
 
     // ── Build per-request plugin context ──────────────────────────────────────
     std::unique_ptr<truellm_context_t> ctx;
     if (plugin_bridge_) {
         ctx = make_context(cfg_, engine_, max_tokens, temp);
+        // Align ctx->request_id with greq.request_id so plugin callbacks
+        // calling host->inject_tokens land on the same key the engine uses
+        // to track active sessions.
+        ctx->request_id = req_id;
+        absorb_client_metadata(ctx.get(), body, req);
     }
+    // RAII: at the end of the chat-completions request — by any exit path —
+    // surface the federated compaction tier's per-request decisions to the
+    // /truellm/v1/chat/status endpoint (Code_Capability_design.md §4.4).
+    //
+    // Capture &ctx (the unique_ptr) rather than ctx.get() so the streaming-
+    // generator path's `ctx.release()` (line ~1011) cleanly disables the
+    // recorder — that path transfers ownership into a chunked-content
+    // provider lambda, where the actual metadata is populated; the lambda
+    // is responsible for calling record_chat_outcome itself.
+    struct ChatOutcomeRecorder {
+        PluginBridge* bridge;
+        std::unique_ptr<truellm_context_t>* ctx_holder;
+        ~ChatOutcomeRecorder() {
+            if (bridge && ctx_holder && *ctx_holder) {
+                bridge->record_chat_outcome(ctx_holder->get());
+                bridge->record_research_outcome(ctx_holder->get());
+            }
+        }
+    } chat_outcome_recorder{ plugin_bridge_, &ctx };
 
     // ── Preprocessor chain ────────────────────────────────────────────────────
     if (plugin_bridge_ && plugin_bridge_->has_preprocessors()) {
@@ -873,12 +1021,36 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
         }
     }
 
+    // ── Detect explicit tool intent ──────────────────────────────────────────
+    // When the client passes `tools` in the request body, or sets
+    // tool_choice="required"/"any", we should NOT route the request through
+    // a generator hook even if rlm_eligible=1: the generator's compressed
+    // context interferes with the model's ability to emit a structured
+    // tool-call JSON.  The flag is consulted post-injection where the
+    // generator dispatch lives.
+    bool client_requested_tools = false;
+    {
+        const auto tc_raw = body.value("tool_choice", json("auto"));
+        std::string tc = tc_raw.is_string() ? tc_raw.get<std::string>() : "auto";
+        const auto ct   = body.value("tools", json::array());
+        client_requested_tools = (!ct.empty()) || (tc == "required" || tc == "any");
+    }
+
     // ── Tool schema injection ─────────────────────────────────────────────────
     // Priority: client-provided tools (request body) > plugin-bridge registry.
     // The schema is MERGED into the existing system message (or a new system
     // message is prepended if none exists).  A second system block is never
     // created, because LLaMA 3 family models immediately emit EOS when they
     // see two consecutive <|start_header_id|>system<|end_header_id|> blocks.
+    //
+    // Stash the pre-injection messages so the generator-dispatch path can
+    // hand the unbloated form to RLM when injection alone overflows the
+    // context window (rlm-suite Check 3 case).  Snapshotting before the
+    // mutation costs one O(n) JSON copy per request — small price for a
+    // crash-free recovery path when the auto-injected schemas would not
+    // fit anyway.
+    json   messages_pre_injection = messages;
+    bool   tool_schemas_were_injected = false;
     {
         // 1. Collect the schemas to inject.
         json client_tools = body.value("tools", json::array());
@@ -951,10 +1123,216 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
             // 4. Rebuild prompt and retokenize.
             prompt      = apply_chat_template(messages, tmpl);
             greq.tokens = engine_->tokenize(prompt);
+            tool_schemas_were_injected = true;
             spdlog::debug("[OpenAI] chat  tool schemas injected  "
                           "tools_json_len={} tool_choice={} merged_into_system={}",
                           all_schemas.dump().size(), tool_choice, merged);
         }
+    }
+
+    // ── Auto-set rlm_eligible on (post-injection) overflow ───────────────────
+    // The token count above already reflects any tool-schema bloat, so this
+    // catches the case where the *original* user request fit but the
+    // injected schemas pushed us past the context window.  The plugin's
+    // own on_claims() also implements a defence-in-depth overflow check.
+    //
+    // When injection itself caused the overflow, we ALSO revert messages /
+    // greq.tokens back to their pre-injection form before handing them to
+    // the generator.  The model could not have used the auto-injected
+    // tools anyway (the engine would crash on the bloated prompt), and
+    // RLM's reconstruct_context preserves the system message verbatim — so
+    // without the revert RLM would just re-emit the same multi-thousand-
+    // token tool schema and the final inference would loop into the same
+    // overflow.
+    if (!client_requested_tools
+        && ctx && plugin_bridge_ && plugin_bridge_->has_generators()) {
+        // The configured context_size in [inference] is the engine's actual
+        // serving budget — the GGUF-declared `model_info.context_length` may
+        // be larger (32 768 on Nemotron-3-Nano, for example) and would let
+        // overflow slip through the check.  batch_scheduler enforces the
+        // configured value, so we must too.
+        const int64_t ctx_len   = static_cast<int64_t>(cfg_.inference.context_size);
+        const int32_t reserved  = std::max<int32_t>(max_tokens, 0);
+        const int64_t budget    = ctx_len > 0 ? (ctx_len - reserved) : 0;
+        const int64_t n_tokens  = static_cast<int64_t>(greq.tokens.size());
+        if (ctx_len > 0 && n_tokens > budget) {
+            {
+                std::lock_guard<std::mutex> lk(ctx->metadata_mu);
+                ctx->metadata["rlm_eligible"]    = "1";
+                ctx->metadata["overflow_tokens"] = std::to_string(n_tokens);
+                ctx->metadata["context_budget"]  = std::to_string(budget);
+            }
+            spdlog::info("[OpenAI] rlm_eligible=1 (post-injection prompt={} "
+                         "toks > budget={} [ctx_size={} max_tokens={}])",
+                         n_tokens, budget, ctx_len, reserved);
+
+            if (tool_schemas_were_injected) {
+                messages    = std::move(messages_pre_injection);
+                prompt      = apply_chat_template(messages, tmpl);
+                greq.tokens = engine_->tokenize(prompt);
+                spdlog::info("[OpenAI] reverted tool-schema injection for "
+                             "generator path (n_tokens now={})",
+                             greq.tokens.size());
+            }
+        }
+    }
+
+    // ── Generator dispatch — priority-ordered claim-and-run ──────────────────
+    // Runs AFTER tool-schema injection so the auto-overflow check above sees
+    // the bloated prompt, AND so any system-message tools the client sees
+    // remain available to the generator if it preserves them.
+    //
+    // Skipped entirely when the client explicitly requested tools via the
+    // request body (`tools` non-empty or `tool_choice` ∈ {required, any}).
+    // RLM-style compression makes structured tool-call emission unreliable;
+    // honouring the client's explicit "use tools" intent takes priority.
+    if (!client_requested_tools
+        && plugin_bridge_ && plugin_bridge_->has_generators()) {
+        if (do_stream) {
+            bool claimed = plugin_bridge_->generator_claims(messages.dump(),
+                                                            ctx.get());
+            if (claimed) {
+                spdlog::info("[OpenAI] chat  generator claimed streaming request "
+                             "req_id={}", req_id);
+                res.set_chunked_content_provider("text/event-stream",
+                    [this, messages_dump = messages.dump(),
+                     ctx_ptr = ctx.release(), req_id, model_id,
+                     completed = false]
+                    (std::size_t /*offset*/, httplib::DataSink& sink) mutable -> bool
+                {
+                    if (completed) return false;
+                    completed = true;
+                    std::unique_ptr<truellm_context_t> owned(ctx_ptr);
+                    ctx_ptr = nullptr;
+
+                    json first = {
+                        {"id",      req_id},
+                        {"object",  "chat.completion.chunk"},
+                        {"model",   model_id},
+                        {"choices", json::array({
+                            {{"delta",        {{"role", "assistant"}}},
+                             {"index",        0},
+                             {"finish_reason", nullptr}}
+                        })}
+                    };
+                    std::string first_msg = "data: " + first.dump() + "\n\n";
+                    sink.write(first_msg.data(), first_msg.size());
+
+                    struct StreamCtx {
+                        httplib::DataSink* sink;
+                        std::string        req_id;
+                        std::string        model_id;
+                        std::string        utf8_carry;
+                    } sc{ &sink, req_id, model_id, {} };
+
+                    auto on_token = [](void* cb, const char* tok, int /*done*/) {
+                        if (!tok || !*tok) return;
+                        auto* st = static_cast<StreamCtx*>(cb);
+                        st->utf8_carry += tok;
+                        std::string emit = sanitize_utf8(st->utf8_carry);
+                        st->utf8_carry.erase(0, emit.size());
+                        if (emit.empty()) return;
+                        json chunk = {
+                            {"id",      st->req_id},
+                            {"object",  "chat.completion.chunk"},
+                            {"model",   st->model_id},
+                            {"choices", json::array({
+                                {{"delta",        {{"content", emit}}},
+                                 {"index",        0},
+                                 {"finish_reason", nullptr}}
+                            })}
+                        };
+                        std::string msg = "data: " + chunk.dump() + "\n\n";
+                        st->sink->write(msg.data(), msg.size());
+                    };
+
+                    auto outcome = plugin_bridge_->try_dispatch_generator(
+                        messages_dump, owned.get(), on_token, &sc);
+
+                    if (!outcome.ok) {
+                        spdlog::warn("[OpenAI] chat  generator stream failed "
+                                     "plugin='{}' err={} msg='{}'",
+                                     outcome.plugin_id,
+                                     static_cast<int>(outcome.error),
+                                     outcome.error_message);
+                    } else {
+                        spdlog::info("[OpenAI] chat  generator stream done "
+                                     "plugin='{}' chars={}",
+                                     outcome.plugin_id, outcome.text.size());
+                    }
+                    sink.write("data: [DONE]\n\n", 14);
+                    sink.done();
+                    // §4.4: record per-request outcomes now — the outer
+                    // ChatOutcomeRecorder is disabled on this path because
+                    // we released ctx into this lambda above.
+                    if (plugin_bridge_ && owned) {
+                        plugin_bridge_->record_chat_outcome(owned.get());
+                        plugin_bridge_->record_research_outcome(owned.get());
+                    }
+                    return true;
+                });
+                return;
+            }
+        } else {
+            auto outcome = plugin_bridge_->try_dispatch_generator(
+                messages.dump(), ctx.get(), nullptr, nullptr);
+            if (outcome.claimed) {
+                if (!outcome.ok) {
+                    spdlog::error("[OpenAI] chat  generator '{}' failed "
+                                  "err={} msg='{}'",
+                                  outcome.plugin_id,
+                                  static_cast<int>(outcome.error),
+                                  outcome.error_message);
+                    res.status = 503;
+                    res.set_content(
+                        error_response(503, "Generator '" + outcome.plugin_id +
+                                             "' error: " + outcome.error_message).dump(),
+                        "application/json");
+                    return;
+                }
+
+                spdlog::info("[OpenAI] chat  generator '{}' produced {} chars",
+                             outcome.plugin_id, outcome.text.size());
+
+                const int completion_tokens =
+                    outcome.text.empty() ? 0
+                                         : static_cast<int>(
+                                             engine_->tokenize(outcome.text).size());
+                const int prompt_tokens = static_cast<int>(greq.tokens.size());
+                json usage = {
+                    {"prompt_tokens",     prompt_tokens},
+                    {"completion_tokens", completion_tokens},
+                    {"total_tokens",      prompt_tokens + completion_tokens}
+                };
+                merge_subcall_usage(usage, ctx.get());
+                // §9.5: emit "length" when the generator's output was
+                // capped by the requested max_tokens; the plugin C ABI
+                // doesn't surface this directly, so we infer it from
+                // completion_tokens vs the request's max_tokens.
+                const char* fr = (max_tokens > 0
+                                  && completion_tokens >= max_tokens)
+                                 ? "length" : "stop";
+                json resp = {
+                    {"id",      req_id},
+                    {"object",  "chat.completion"},
+                    {"created", unix_now()},
+                    {"model",   model_id},
+                    {"choices", json::array({
+                        {{"message",      {{"role",    "assistant"},
+                                           {"content", sanitize_utf8(outcome.text)}}},
+                         {"index",        0},
+                         {"finish_reason", fr}}
+                    })},
+                    {"usage",   usage}
+                };
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+        }
+    } else if (client_requested_tools && plugin_bridge_
+               && plugin_bridge_->has_generators()) {
+        spdlog::debug("[OpenAI] chat  generator dispatch skipped "
+                      "(client_requested_tools=true)");
     }
 
     if (do_stream) {
@@ -1064,15 +1442,49 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
                 std::string args    = tool_args_string(call);
                 std::string call_id = call.value("id", "call_" + std::to_string(tool_round));
 
+                // §3.3.2 / §3.0 — honour the per-request agent.allowed_tools
+                // contract set by plan_mode_guard or fork_agent_pool.  Refuse
+                // the call before it reaches the plugin so the engine, not
+                // the agent harness, owns enforcement.
+                std::string allow_csv;
+                if (ctx) {
+                    std::lock_guard<std::mutex> lk(ctx->metadata_mu);
+                    auto it = ctx->metadata.find("agent.allowed_tools");
+                    if (it != ctx->metadata.end()) allow_csv = it->second;
+                }
+                if (!is_tool_allowed(qname, allow_csv)) {
+                    spdlog::info("[OpenAI] tool '{}' refused by agent.allowed_tools "
+                                 "(scope={})", qname,
+                                 allow_csv.empty() ? "(none)" : allow_csv);
+                    messages.push_back({
+                        {"role",         "tool"},
+                        {"tool_call_id", call_id},
+                        {"content",      format_tool_denial(
+                            "tool '" + qname + "' is not in the allow-list "
+                            "(agent.allowed_tools).  Use a different tool or "
+                            "ask the user to widen the scope.")}
+                    });
+                    continue;
+                }
+
                 spdlog::debug("[OpenAI] dispatching tool '{}'  args_len={}", qname, args.size());
                 ToolCallResult tc = plugin_bridge_->dispatch_tool(qname, args, ctx.get());
 
+                std::string body;
+                if (tc.error == TRUELLM_OK) {
+                    body = tc.payload;
+                } else if (tc.error == TRUELLM_ERR_PERMISSION) {
+                    body = format_tool_denial(
+                        tc.error_msg.empty()
+                            ? std::string("tool refused the request")
+                            : tc.error_msg);
+                } else {
+                    body = "[Tool error] " + tc.error_msg;
+                }
                 messages.push_back({
                     {"role",         "tool"},
                     {"tool_call_id", call_id},
-                    {"content",      tc.error == TRUELLM_OK
-                                     ? tc.payload
-                                     : "[Tool error] " + tc.error_msg}
+                    {"content",      body}
                 });
             }
 
@@ -1214,6 +1626,12 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
                       result.text.size() > 256
                           ? result.text.substr(0, 256) + "…" : result.text);
 
+        json usage = {
+            {"prompt_tokens",     result.prompt_tokens},
+            {"completion_tokens", result.generated_tokens},
+            {"total_tokens",      result.prompt_tokens + result.generated_tokens}
+        };
+        merge_subcall_usage(usage, ctx.get());
         json resp = {
             {"id",      req_id},
             {"object",  "chat.completion"},
@@ -1223,13 +1641,10 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
                 {{"message",      {{"role",    "assistant"},
                                    {"content", sanitize_utf8(result.text)}}},
                  {"index",        0},
-                 {"finish_reason","stop"}}
+                 {"finish_reason", result.finish_reason.empty()
+                                      ? "stop" : result.finish_reason}}
             })},
-            {"usage", {
-                {"prompt_tokens",     result.prompt_tokens},
-                {"completion_tokens", result.generated_tokens},
-                {"total_tokens",      result.prompt_tokens + result.generated_tokens}
-            }}
+            {"usage",   usage}
         };
         res.set_content(resp.dump(), "application/json");
     }

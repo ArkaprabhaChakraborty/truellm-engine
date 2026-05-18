@@ -203,6 +203,78 @@ struct truellm_host_api_t {
     // Returns NULL when the capability is absent or not yet resolved.
     const char* (*get_server_capability)(const truellm_context_t* ctx,
                                          const char* cap_key);
+
+    // =========================================================================
+    // api_minor >= 2 entries — sandboxed plugin data dir + blob fs API.
+    // Indexed-storage plugins (e.g. evidence_store) link libsqlite3 directly
+    // through the SDK helper truellm/storage_sqlite.h; the engine just owns
+    // the per-plugin sandbox path resolution.  See Code_Capability_design.md
+    // §4.1 / §4.1b / §4.7 for the three storage tiers.
+    //
+    // Path policy
+    //   * relpath is rejected if it contains "..", a leading separator, a
+    //     drive letter (Windows), or a NUL byte.
+    //   * The engine creates ${data_dir}/<plugin_id>/ at first use.
+    //   * Writes are atomic: tmpfile + fsync + rename.  Concurrent writers
+    //     to the same key serialise via flock(2) on a sibling .lock file —
+    //     never via filesystem CAS, which fails under parallel fork agents.
+    // =========================================================================
+
+    // Returns the absolute, sandboxed per-plugin data directory.  The string
+    // is engine-owned and stable for process lifetime.  NULL when plugins
+    // have no data dir configured (operator turned the feature off).
+    const char* (*plugin_data_dir)(const char* plugin_id);
+
+    // Atomic blob write under <data_dir>/<plugin_id>/<relpath>.
+    truellm_error_t (*plugin_fs_write)(const char* plugin_id,
+                                        const char* relpath,
+                                        const void* bytes, size_t n_bytes);
+
+    // Read a blob.  *out_bytes is engine-allocated; caller frees with
+    // host->dealloc().  Returns TRUELLM_ERR_NOT_FOUND if the file is absent.
+    truellm_error_t (*plugin_fs_read)(const char* plugin_id,
+                                       const char* relpath,
+                                       void** out_bytes, size_t* out_n);
+
+    // Remove a blob.  Returns TRUELLM_ERR_NOT_FOUND when absent (idempotent
+    // unlink is the caller's responsibility — they can ignore NOT_FOUND).
+    truellm_error_t (*plugin_fs_unlink)(const char* plugin_id,
+                                         const char* relpath);
+
+    // List a directory.  *out_names is a NULL-terminated engine-allocated
+    // array of engine-allocated strings.  The caller frees each name and
+    // the array via host->dealloc().  *out_count receives the entry count
+    // (excluding the trailing NULL).
+    truellm_error_t (*plugin_fs_listdir)(const char* plugin_id,
+                                          const char* relpath,
+                                          char*** out_names,
+                                          size_t* out_count);
+
+    // =========================================================================
+    // api_minor >= 3 entries — cross-plugin tool dispatch.
+    //
+    // Generators in the federated set (research_orchestrator,
+    // research_synthesizer, future agentic plugins) need to invoke other
+    // plugins' tools as part of a single HTTP turn.  call_tool routes
+    // through the same dispatch path the openai_router tool loop uses:
+    //   - the qualified name is resolved against the registered tool set
+    //     (short-name fallback supported);
+    //   - the agent.allowed_tools enforcement (§3.3.2) applies just as it
+    //     would for a model-emitted tool_call;
+    //   - the tool's TRUELLM_OK / TRUELLM_ERR_PERMISSION / TRUELLM_ERR_*
+    //     result is faithfully reported back.
+    //
+    // result_json_out is engine-allocated and shaped:
+    //   { "ok": bool,            // true if the dispatch completed
+    //     "error_code": int,     // tool's truellm_error_t value
+    //     "error_msg": "...",    // empty on success
+    //     "payload": "..." }     // tool's payload string (may be JSON)
+    // Caller frees with host->dealloc().
+    truellm_error_t (*call_tool)(
+        const truellm_context_t* ctx,
+        const char*              qualified_name,
+        const char*              args_json,
+        char**                   result_json_out);
 };
 
 #ifdef __cplusplus
