@@ -67,8 +67,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
     set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
-    set(LLAMA_BUILD_COMMON   OFF CACHE BOOL "" FORCE)
+    # common holds the chat-template (jinja) engine + per-model chat/tool/reasoning
+    # parsers (common_chat_*) and json-schema-to-grammar.  TrueLLM wraps these in
+    # src/server/chat_format.{h,cpp} for faithful prompt templating, reasoning
+    # (thinking) streaming, and constrained output.  Light deps: links only
+    # llama + cpp-httplib (already used) + Threads; llguidance stays OFF.
+    set(LLAMA_BUILD_COMMON   ON  CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
+    set(LLAMA_LLGUIDANCE     OFF CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS    OFF CACHE BOOL "" FORCE)
 
     # Forward our CUDA option to llama.cpp's GGML

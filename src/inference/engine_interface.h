@@ -55,6 +55,16 @@ struct ModelInfo {
     int32_t     n_heads;
     int32_t     head_dim;
     DataType    dtype;           // weight precision
+
+    // Chat-template seam (filled at load time): the model's own embedded
+    // Jinja chat template from GGUF metadata, plus the BOS/EOS token *strings*.
+    // The server layer feeds these to common_chat_templates_init (with a null
+    // llama_model) so it can render faithful prompts and parse reasoning/tool
+    // markers without including any backend/llama header.  chat_template is
+    // empty when the GGUF carries no template — the server falls back to chatml.
+    std::string chat_template;
+    std::string bos_token;
+    std::string eos_token;
 };
 
 // ---------------------------------------------------------------------------
@@ -76,6 +86,17 @@ struct GenerateRequest {
 
     // Stop sequences (strings) — per-request, merged with SamplingConfig::stop
     std::vector<std::string> stop;
+
+    // Optional GBNF grammar to constrain decoding (empty = unconstrained).
+    // Produced by the server's chat_format layer from common_chat_params:
+    // either a tool-call grammar (so the model emits well-formed calls) or a
+    // response_format: json_schema grammar.  Applied via a per-request
+    // llama_sampler_init_grammar prepended to the standard sampler chain.
+    // grammar_lazy = true means the grammar is only enforced after one of the
+    // trigger patterns appears (used for tool-call grammars so plain prose is
+    // still allowed); CPU backend treats lazy grammars as best-effort.
+    std::string          grammar;
+    bool                 grammar_lazy = false;
 
     // Optional request id used for active-session tracking.  Backends that
     // implement inject_tokens key their request_id → seq_id map on this

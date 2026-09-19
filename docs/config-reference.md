@@ -21,6 +21,7 @@ This document describes every configuration section and field supported by
 3. [[server]](#server)
 4. [[model]](#model)
 5. [[inference]](#inference)
+   - [[inference.reasoning]](#inferencereasoning)
    - [[inference.kv_cache]](#inferencekv_cache)
    - [[inference.cuda]](#inferencecuda)
    - [[inference.cuda_engine]](#inferencecuda_engine)
@@ -157,6 +158,24 @@ Core inference engine settings.
 | `mmap`            | bool    | `true`   | Memory-map the GGUF file. Enables fast startup and allows the OS to page out unused model weights. Disable if the model is on a network filesystem. |
 | `mlock`           | bool    | `false`  | Lock model pages into RAM to prevent swapping. Requires `CAP_IPC_LOCK` on Linux or Administrator on Windows. |
 | `numa`            | string  | `"disabled"` | NUMA memory policy. Valid: `"disabled"`, `"distribute"` (spread across NUMA nodes), `"isolate"` (restrict to a single node). |
+
+---
+
+## [inference.reasoning]
+
+Controls reasoning ("thinking") separation for reasoning models (DeepSeek-R1,
+Qwen3, QwQ, gpt-oss). When enabled, the server splits the model's thinking from
+its answer using the model's own chat template (via llama.cpp's `common_chat`
+layer). The thinking is surfaced as a separate `reasoning_content` field on
+OpenAI `/v1/chat/completions` responses and streamed `delta.reasoning_content`
+chunks, and as `thinking` content blocks on the Anthropic `/v1/messages` API.
+Requires the engine to be built with `LLAMA_BUILD_COMMON=ON` (the default); when
+unavailable the server transparently falls back to inline thinking.
+
+| Key               | Type   | Default  | Description |
+|-------------------|--------|----------|-------------|
+| `format`          | string | `"auto"` | Reasoning extraction mode. `"auto"`/`"deepseek"` split thinking into `reasoning_content`; `"none"` leaves it inline in `content` (legacy behaviour). |
+| `enable_thinking` | bool   | `true`   | When `false`, suppress reasoning where the chat template supports a thinking on/off switch (e.g. Qwen3). |
 
 ---
 

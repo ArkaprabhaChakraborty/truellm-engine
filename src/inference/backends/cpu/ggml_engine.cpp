@@ -105,6 +105,11 @@ ModelInfo GgmlEngine::get_model_info() const
     info.n_heads        = 0; // not directly exposed via stable API
     info.head_dim       = 0;
     info.dtype          = DataType::F16; // GGUF quantized; report as f16 for now
+
+    // Chat-template seam — feeds the server's chat_format (common_chat) layer.
+    info.chat_template  = model_->chat_template();
+    info.bos_token      = model_->bos_token();
+    info.eos_token      = model_->eos_token();
     return info;
 }
 
@@ -210,6 +215,19 @@ GenerateResult GgmlEngine::generate(const GenerateRequest& req)
     // Reset the KV cache for a fresh generation
     ctx_->reset();
 
+    // Per-request grammar: when the router supplies a GBNF grammar (tool-call
+    // or response_format: json_schema), build a temporary grammar-constrained
+    // sampler for this request only.  Falls back to the shared sampler when the
+    // grammar is empty or fails to parse.  RAII frees it at scope exit.
+    struct SamplerGuard {
+        llama_sampler* s = nullptr;
+        ~SamplerGuard() { if (s) llama_sampler_free(s); }
+    } grammar_sampler;
+    if (!req.grammar.empty()) {
+        grammar_sampler.s = ctx_->make_grammar_sampler(*model_, req.grammar);
+    }
+    llama_sampler* sampler = grammar_sampler.s ? grammar_sampler.s : ctx_->sampler();
+
     // Rebuild the sampler with any per-request overrides.
     // For now we use config defaults; per-request temp/top_p override
     // would require a temporary SamplingConfig here.
@@ -222,16 +240,27 @@ GenerateResult GgmlEngine::generate(const GenerateRequest& req)
     auto t_start = std::chrono::steady_clock::now();
 
     // ---- Prefill ----
+    // Feed the prompt in n_batch-sized chunks.  llama_decode asserts
+    // n_tokens_all <= cparams.n_batch, so a prompt larger than the configured
+    // batch_size must be split across several decode calls.  llama_batch_get_one
+    // auto-assigns sequential positions continuing from the KV cache, so
+    // successive chunks stitch together transparently.
     std::vector<llama_token> prompt_tokens(req.tokens.begin(), req.tokens.end());
-    llama_batch batch = llama_batch_get_one(prompt_tokens.data(),
-                                            static_cast<int32_t>(prompt_tokens.size()));
+    const int32_t n_batch = static_cast<int32_t>(llama_n_batch(ctx_->raw()));
+    const int32_t n_prompt = static_cast<int32_t>(prompt_tokens.size());
+    llama_batch batch{};
 
     auto t_prefill_start = std::chrono::steady_clock::now();
-    if (llama_decode(ctx_->raw(), batch) != 0) {
-        result.error         = ErrorCode::InternalError;
-        result.error_message = "llama_decode (prefill) failed";
-        spdlog::error("[Engine] llama_decode (prefill) failed");
-        return result;
+    for (int32_t off = 0; off < n_prompt; off += n_batch) {
+        const int32_t chunk = std::min(n_batch, n_prompt - off);
+        batch = llama_batch_get_one(prompt_tokens.data() + off, chunk);
+        if (llama_decode(ctx_->raw(), batch) != 0) {
+            result.error         = ErrorCode::InternalError;
+            result.error_message = "llama_decode (prefill) failed";
+            spdlog::error("[Engine] llama_decode (prefill) failed at offset {}/{}",
+                          off, n_prompt);
+            return result;
+        }
     }
     float prefill_ms = static_cast<float>(
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -251,7 +280,7 @@ GenerateResult GgmlEngine::generate(const GenerateRequest& req)
 
     int n_generated = 0;
     while (n_generated < max_new) {
-        llama_token id = llama_sampler_sample(ctx_->sampler(), ctx_->raw(), -1);
+        llama_token id = llama_sampler_sample(sampler, ctx_->raw(), -1);
 
         // EOG check — log the first token so we can diagnose silent early-exit
         if (n_generated == 0) {

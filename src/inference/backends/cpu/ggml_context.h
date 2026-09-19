@@ -31,6 +31,13 @@ public:
     llama_context* raw()     { return ctx_; }
     llama_sampler* sampler() { return sampler_; }
 
+    // Build a fresh sampler chain that additionally constrains decoding to the
+    // given GBNF grammar (root rule "root").  Returns nullptr when the grammar
+    // fails to parse, in which case callers fall back to the shared sampler().
+    // The caller owns the returned sampler and must llama_sampler_free() it.
+    llama_sampler* make_grammar_sampler(GgmlModel& model,
+                                        const std::string& grammar) const;
+
     bool is_valid() const { return ctx_ != nullptr; }
 
 private:
@@ -39,6 +46,9 @@ private:
     llama_context*         ctx_     = nullptr;
     llama_sampler*         sampler_ = nullptr;
 
+    // Populate `chain` with the standard top_k/top_p/min_p/temp/penalties/dist
+    // samplers from smp_cfg_.  Shared by build_sampler and make_grammar_sampler.
+    void add_standard_samplers(llama_sampler* chain) const;
     void build_sampler(GgmlModel& model);
 };
 

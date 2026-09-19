@@ -354,6 +354,23 @@ ModelInfo CudaModel::get_model_info() const
     info.n_heads        = n_heads_;
     info.head_dim       = head_dim_;
     info.dtype          = DataType::F16;
+
+    // Chat-template seam — feeds the server's chat_format (common_chat) layer.
+    if (const char* tmpl = llama_model_chat_template(model_, /*name=*/nullptr))
+        info.chat_template = tmpl;
+    if (const llama_vocab* v = llama_model_get_vocab(model_)) {
+        char buf[64];
+        llama_token bos = llama_vocab_bos(v);
+        if (bos != LLAMA_TOKEN_NULL) {
+            int n = llama_token_to_piece(v, bos, buf, sizeof(buf), 0, /*special=*/true);
+            if (n > 0) info.bos_token.assign(buf, static_cast<std::size_t>(n));
+        }
+        llama_token eos = llama_vocab_eos(v);
+        if (eos != LLAMA_TOKEN_NULL) {
+            int n = llama_token_to_piece(v, eos, buf, sizeof(buf), 0, /*special=*/true);
+            if (n > 0) info.eos_token.assign(buf, static_cast<std::size_t>(n));
+        }
+    }
     return info;
 }
 

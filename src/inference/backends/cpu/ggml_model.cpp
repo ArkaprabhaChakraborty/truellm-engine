@@ -149,6 +149,32 @@ int64_t GgmlModel::vocab_size() const
     return model_ ? static_cast<int64_t>(llama_vocab_n_tokens(llama_model_get_vocab(model_))) : 0;
 }
 
+std::string GgmlModel::chat_template() const
+{
+    if (!model_) return {};
+    const char* tmpl = llama_model_chat_template(model_, /*name=*/nullptr);
+    return tmpl ? std::string(tmpl) : std::string{};
+}
+
+// Render a single special token to its piece string (e.g. "<s>", "</s>",
+// "<|begin_of_text|>").  Empty when the model has no such token.
+static std::string token_piece(const llama_model* model, bool want_bos)
+{
+    if (!model) return {};
+    const llama_vocab* vocab = llama_model_get_vocab(model);
+    if (!vocab) return {};
+    llama_token tok = want_bos ? llama_vocab_bos(vocab) : llama_vocab_eos(vocab);
+    if (tok == LLAMA_TOKEN_NULL) return {};
+    char buf[64];
+    int n = llama_token_to_piece(vocab, tok, buf, sizeof(buf),
+                                 /*lstrip=*/0, /*special=*/true);
+    if (n <= 0) return {};
+    return std::string(buf, static_cast<std::size_t>(n));
+}
+
+std::string GgmlModel::bos_token() const { return token_piece(model_, /*want_bos=*/true);  }
+std::string GgmlModel::eos_token() const { return token_piece(model_, /*want_bos=*/false); }
+
 int64_t GgmlModel::layer_size_bytes_estimate() const
 {
     if (!model_) return 0;

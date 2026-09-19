@@ -21,6 +21,7 @@ HttpServer::HttpServer(const TrueLLMConfig& cfg, EngineInterface* engine)
     , engine_(engine)
     , openai_router_(cfg, engine)
     , native_router_(cfg, engine)
+    , anthropic_router_(cfg, engine, &openai_router_)
 {
     // Build a rate limiter config from the guardrail preset so that rate
     // limiting tightens and loosens together with memory guardrails.
@@ -98,6 +99,12 @@ void HttpServer::setup_routes()
     // ---- TrueLLM native routes ----
     native_router_.register_routes(svr_, [this](const httplib::Request& req,
                                                  httplib::Response& res) {
+        return check_auth(req, res);
+    });
+
+    // ---- Anthropic Messages API (/v1/messages) — Code_Capability_design.md §12 ----
+    anthropic_router_.register_routes(svr_, [this](const httplib::Request& req,
+                                                    httplib::Response& res) {
         return check_auth(req, res);
     });
 

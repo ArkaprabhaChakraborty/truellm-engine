@@ -42,6 +42,13 @@ public:
     int64_t vocab_size()  const;
     int64_t layer_size_bytes_estimate() const; // avg weight bytes per layer
 
+    // Chat-template seam for the server's chat_format layer.
+    // chat_template(): the GGUF-embedded Jinja template ("" when absent).
+    // bos_token()/eos_token(): the BOS/EOS token rendered to its piece string.
+    std::string chat_template() const;
+    std::string bos_token()     const;
+    std::string eos_token()     const;
+
 private:
     const InferenceConfig& inf_cfg_;
     const HardwareConfig&  hw_cfg_;

@@ -59,7 +59,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "TRUELLM_BACKEND": "CUDA",
         "CMAKE_CUDA_ARCHITECTURES": "75;80;86;89;90;120",
-        "TRUELLM_BUILD_CUDA_ENGINE": "ON"
+        "TRUELLM_BUILD_CUDA_ENGINE": "ON",
+        "GGML_CUDA_NO_VMM": "ON"
       },
       "condition": {
         "type": "equals",
@@ -93,7 +94,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "TRUELLM_BACKEND": "CUDA",
         "CMAKE_CUDA_ARCHITECTURES": "75;80;86;89;90;120",
-        "TRUELLM_BUILD_CUDA_ENGINE": "ON"
+        "TRUELLM_BUILD_CUDA_ENGINE": "ON",
+        "GGML_CUDA_NO_VMM": "ON"
       },
       "condition": {
         "type": "equals",

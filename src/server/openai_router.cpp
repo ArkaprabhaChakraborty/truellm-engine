@@ -219,6 +219,23 @@ OpenAIRouter::OpenAIRouter(const TrueLLMConfig& cfg, EngineInterface* engine)
     : cfg_(cfg), engine_(engine)
 {}
 
+// Lazily build the common_chat formatter from the loaded model's embedded
+// chat template.  Called once per process (the model doesn't change at
+// runtime).  On any failure chat_fmt_.valid() stays false and the router
+// transparently uses the legacy apply_chat_template path.
+void OpenAIRouter::ensure_chat_formatter()
+{
+    if (chat_fmt_tried_) return;
+    chat_fmt_tried_ = true;
+    if (!engine_) return;
+    ModelInfo mi = engine_->get_model_info();
+    bool ok = chat_fmt_.init(mi.chat_template, mi.bos_token, mi.eos_token,
+                             cfg_.inference.reasoning.format);
+    spdlog::info("[OpenAI] chat_format {} (template_chars={} reasoning={})",
+                 ok ? "ready (common_chat)" : "unavailable — legacy templates",
+                 mi.chat_template.size(), cfg_.inference.reasoning.format);
+}
+
 void OpenAIRouter::register_routes(httplib::Server& svr, AuthCheck auth)
 {
     svr.Get("/v1/models",
@@ -439,6 +456,121 @@ static json parse_tool_calls(const std::string& raw)
 }
 
 // ---------------------------------------------------------------------------
+// canonical_tool_calls — rewrite a tool_calls array to OpenAI-canonical wire
+// form: every entry is {id, type:"function", function:{name, arguments}} with
+// `arguments` guaranteed to be a JSON-encoded *string*.  Models — and the
+// {"tool_calls":[...]} branch of parse_tool_calls — frequently leave
+// `arguments` as a raw object; OpenAI clients and the AnthropicRouter both
+// expect a string, so normalise once here before the calls leave the engine.
+// ---------------------------------------------------------------------------
+static json canonical_tool_calls(const json& calls)
+{
+    json out = json::array();
+    if (!calls.is_array()) return out;
+    int idx = 0;
+    for (const auto& c : calls) {
+        const json fn = c.value("function", json::object());
+        out.push_back({
+            {"id",   c.value("id", "call_" + std::to_string(idx))},
+            {"type", "function"},
+            {"function", {
+                {"name",      fn.value("name", "")},
+                {"arguments", tool_args_string(c)},
+            }},
+        });
+        ++idx;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// first_json_key — the first object key of a (possibly truncated/malformed)
+// JSON string, or "" when the string does not open as `{ "key" ...`.  Lets
+// text_is_pure_tool_call recognise a tool-call payload that strict parsing
+// would reject because the model dropped a closing brace.
+// ---------------------------------------------------------------------------
+static std::string first_json_key(const std::string& t)
+{
+    std::size_t i = 0;
+    auto skip_ws = [&] {
+        while (i < t.size()
+               && (t[i] == ' ' || t[i] == '\t' || t[i] == '\r' || t[i] == '\n'))
+            ++i;
+    };
+    skip_ws();
+    if (i >= t.size() || t[i] != '{') return "";
+    ++i; skip_ws();
+    if (i >= t.size() || t[i] != '"') return "";
+    ++i;
+    std::string key;
+    while (i < t.size() && t[i] != '"') {
+        if (t[i] == '\\' && i + 1 < t.size()) ++i;   // skip an escape pair
+        key += t[i++];
+    }
+    return key;
+}
+
+// ---------------------------------------------------------------------------
+// text_is_pure_tool_call — true when the model's entire output is just a
+// tool-call payload (a raw JSON envelope, or one recognised wrapper around
+// one), i.e. there is no real prose to surface as message content alongside
+// the parsed tool_calls.  Used by the client_tools path so the raw
+// {"tool_calls":[...]} JSON is not echoed back as assistant text.
+// ---------------------------------------------------------------------------
+static bool text_is_pure_tool_call(const std::string& raw)
+{
+    auto trim = [](std::string s) -> std::string {
+        const char* ws = " \t\r\n";
+        auto b = s.find_first_not_of(ws);
+        if (b == std::string::npos) return std::string();
+        auto e = s.find_last_not_of(ws);
+        return s.substr(b, e - b + 1);
+    };
+
+    std::string t = trim(raw);
+    if (t.empty()) return false;
+
+    // Peel one recognised wrapper, if the whole string is wrapped by it.
+    auto unwrap = [&](const std::string& open, const std::string& close) {
+        if (t.size() >= open.size() + close.size()
+            && t.compare(0, open.size(), open) == 0
+            && t.compare(t.size() - close.size(), close.size(), close) == 0)
+            t = trim(t.substr(open.size(),
+                              t.size() - open.size() - close.size()));
+    };
+    unwrap("```json", "```");
+    unwrap("```", "```");
+    unwrap("<tool_call>", "</tool_call>");
+    if (t.rfind("<|python_tag|>", 0) == 0)
+        t = trim(t.substr(std::string("<|python_tag|>").size()));
+    {
+        const std::string eom = "<|eom_id|>";
+        if (t.size() >= eom.size()
+            && t.compare(t.size() - eom.size(), eom.size(), eom) == 0)
+            t = trim(t.substr(0, t.size() - eom.size()));
+    }
+
+    auto j = json::parse(t, nullptr, false);
+    if (!j.is_discarded()) {
+        if (j.contains("tool_calls") && j["tool_calls"].is_array()) return true;
+        auto single = normalise_single_call(j);
+        if (!single.is_null() && !single.empty()) return true;
+    }
+
+    // Lenient fallback: models frequently emit *malformed* tool-call JSON —
+    // a dropped closing brace — which parse_tool_calls still recovers via
+    // brace matching but strict parsing above rejects.  If the whole turn
+    // nonetheless opens as a tool-call object, treat it as pure so the
+    // broken JSON is not echoed back as an assistant text block.
+    if (!t.empty() && t.front() == '{') {
+        const std::string k = first_json_key(t);
+        return k == "tool_calls" || k == "name"       || k == "tool"
+            || k == "function"   || k == "parameters" || k == "arguments";
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // make_context — construct a per-request plugin context
 // ---------------------------------------------------------------------------
 static std::unique_ptr<truellm_context_t> make_context(
@@ -454,6 +586,36 @@ static std::unique_ptr<truellm_context_t> make_context(
     ctx->temperature   = temperature;
     ctx->status_sink   = nullptr;
     return ctx;
+}
+
+// ---------------------------------------------------------------------------
+// strip_tool_call_json — remove the raw {"tool_calls":[...]} payload (and any
+// ```json fence) from a round's text, leaving only the model's prose.  Used to
+// turn a tool-use round into a "thinking stage": the client sees the model's
+// narration ("I'll search for…") but never the tool name/arguments JSON — the
+// tool registry is the server owner's concern, not the end user's.
+// ---------------------------------------------------------------------------
+static std::string strip_tool_call_json(const std::string& text)
+{
+    auto trim = [](std::string s) {
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))   s.pop_back();
+        std::size_t b = 0;
+        while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b])))      ++b;
+        return s.substr(b);
+    };
+    auto key = text.find("\"tool_calls\"");
+    if (key == std::string::npos) return trim(text);
+    auto brace = text.rfind('{', key);
+    if (brace == std::string::npos) return trim(text);
+    std::string head = text.substr(0, brace);
+    // Drop a trailing ```json (or ```) fence that opened the JSON block.
+    auto fence = head.rfind("```");
+    if (fence != std::string::npos) {
+        std::string tail = head.substr(fence);
+        if (tail.find_first_not_of("`json \t\r\n") == std::string::npos)
+            head = head.substr(0, fence);
+    }
+    return trim(head);
 }
 
 // ---------------------------------------------------------------------------
@@ -893,6 +1055,34 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
     float temp     = body.value("temperature", cfg_.sampling.temperature);
     bool do_stream = body.value("stream",      false);
 
+    // §12.6 — client_tools: when set (AnthropicRouter always sets it),
+    // the non-streaming tool loop returns tool calls to the caller
+    // instead of dispatching them server-side.  Default off → the
+    // existing server-side tool loop is completely unchanged.
+    bool client_tools = false;
+    try {
+        if (body.contains("extra_body") && body["extra_body"].is_object()
+            && body["extra_body"].contains("truellm")
+            && body["extra_body"]["truellm"].is_object())
+            client_tools = body["extra_body"]["truellm"]
+                               .value("client_tools", false);
+    } catch (...) {}
+
+    // A client that passes its own `tools` array in the request body owns those
+    // tools and executes them itself — that is the standard OpenAI agent loop
+    // (e.g. the Hermes desktop app advertising memory / skill_manage /
+    // browser_navigate).  The model's tool calls are CLIENT tool calls: return
+    // them to the caller (finish_reason="tool_calls") instead of dispatching
+    // them against the server's own plugin registry, which would "tool not
+    // found" every client tool and burn every round into an empty reply.
+    // Server-side auto-dispatch (plugin tools as hidden thinking stages) stays
+    // the behaviour only when the client provided NO tools of its own — in that
+    // case only the server's plugin schemas are injected (see schema injection
+    // below), so every emitted call is genuinely a server plugin tool.
+    if (body.contains("tools") && body["tools"].is_array()
+        && !body["tools"].empty())
+        client_tools = true;
+
     spdlog::debug("[OpenAI] chat  messages={} max_tokens={} temp={:.2f} stream={}",
                   messages.size(), max_tokens, temp, do_stream);
     spdlog::trace("[OpenAI] chat  messages: {}", trace_json(messages));
@@ -900,9 +1090,60 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
     // Apply chat template — auto-detect from GGUF architecture when not explicit.
     std::string arch = engine_->get_model_info().architecture;
     std::string tmpl = resolve_template(cfg_.model.chat_template, arch);
-    std::string prompt = apply_chat_template(messages, tmpl);
 
-    spdlog::debug("[OpenAI] chat  template={} arch={} prompt_chars={}", tmpl, arch, prompt.size());
+    // common_chat path: render the conversation with the model's own embedded
+    // Jinja template (faithful) and configure a parser that separates
+    // reasoning_content from content.  We deliberately do NOT pass `tools` here
+    // — TrueLLM keeps its own tool-schema text injection + parse_tool_calls
+    // pipeline below; the template just renders the turns.  Falls back to the
+    // legacy 4-template path when the formatter is unavailable.
+    ensure_chat_formatter();
+    const bool thinking_enabled = cfg_.inference.reasoning.enable_thinking;
+
+    // response_format: json_schema → GBNF grammar (constrained output).
+    std::string response_schema;
+    try {
+        if (body.contains("response_format") && body["response_format"].is_object()) {
+            const auto& rf = body["response_format"];
+            if (rf.value("type", "") == "json_schema" && rf.contains("json_schema")) {
+                const auto& js = rf["json_schema"];
+                if (js.is_object() && js.contains("schema"))
+                    response_schema = js["schema"].dump();
+            }
+        }
+    } catch (...) {}
+
+    // render() — faithful prompt for the current `messages`, common_chat when
+    // available else legacy.  Reused by the tool loop's prompt rebuilds.
+    auto render = [&](const json& msgs) -> std::string {
+        if (chat_fmt_.valid()) {
+            ChatParser scratch;
+            ChatApplied a = chat_fmt_.apply(msgs.dump(), /*tools=*/"", /*tool_choice=*/"",
+                                            /*json_schema=*/"", thinking_enabled, scratch);
+            if (a.valid) return a.prompt;
+        }
+        return apply_chat_template(msgs, tmpl);
+    };
+
+    // Response parser + grammar from the initial apply (captures format for
+    // reasoning extraction; grammar non-empty only for response_format).
+    ChatParser rsp_parser;
+    std::string prompt;
+    std::string applied_grammar;
+    std::vector<std::string> applied_stops;
+    if (chat_fmt_.valid()) {
+        ChatApplied a = chat_fmt_.apply(messages.dump(), /*tools=*/"", /*tool_choice=*/"",
+                                        response_schema, thinking_enabled, rsp_parser);
+        if (a.valid) {
+            prompt          = a.prompt;
+            applied_grammar = a.grammar;
+            applied_stops   = a.additional_stops;
+        }
+    }
+    if (prompt.empty()) prompt = apply_chat_template(messages, tmpl);
+
+    spdlog::debug("[OpenAI] chat  template={} arch={} prompt_chars={} common_chat={}",
+                  tmpl, arch, prompt.size(), chat_fmt_.valid());
     spdlog::trace("[OpenAI] chat  formatted prompt:\n{}", prompt);
 
     auto t_tok = std::chrono::steady_clock::now();
@@ -922,6 +1163,11 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
         if (sv.is_string())      greq.stop.push_back(sv.get<std::string>());
         else if (sv.is_array())  for (const auto& s : sv) if (s.is_string()) greq.stop.push_back(s.get<std::string>());
     }
+
+    // common_chat: template-mandated stops + response_format grammar.
+    for (const auto& s : applied_stops)
+        if (!s.empty()) greq.stop.push_back(s);
+    greq.grammar = applied_grammar;
 
     std::string req_id   = "chatcmpl-" + std::to_string(unix_now());
     std::string model_id = cfg_.model.alias.empty() ? "default" : cfg_.model.alias;
@@ -1054,8 +1300,29 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
     {
         // 1. Collect the schemas to inject.
         json client_tools = body.value("tools", json::array());
-        std::string tool_choice = body.value("tool_choice", "auto");
-        // tool_choice may also be an object {"type":"function",...}; normalise.
+        // tool_choice may be a string ("auto"/"required"/"none") OR an
+        // object: {"type":"function","function":{"name":"X"}} forces tool X;
+        // {"type":"auto"|"required"|"none"} is the object spelling of the
+        // string forms.  Reading it with value<string> throws type_error.302
+        // on the object form — normalise defensively.
+        std::string tool_choice = "auto";
+        std::string forced_tool;            // non-empty => exactly one tool
+        if (body.contains("tool_choice")) {
+            const json& tc = body["tool_choice"];
+            if (tc.is_string()) {
+                tool_choice = tc.get<std::string>();
+            } else if (tc.is_object()) {
+                const std::string tt = tc.value("type", "");
+                if (tt == "function") {
+                    tool_choice = "required";
+                    forced_tool = tc.value("function", json::object())
+                                    .value("name", std::string());
+                } else if (tt == "required" || tt == "auto"
+                           || tt == "none" || tt == "any") {
+                    tool_choice = (tt == "any") ? "required" : tt;
+                }
+            }
+        }
         if (tool_choice.empty()) tool_choice = "auto";
 
         json all_schemas = json::array();
@@ -1098,10 +1365,21 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
                 "not explicitly listed. Do not produce error messages about missing tools.";
 
             if (tool_choice == "required") {
-                tool_instr +=
-                    "\n\nIMPORTANT: You MUST call one of the above tools to answer "
-                    "this request.  Do not reply with plain text until after you "
-                    "have called a tool and received its result.";
+                if (!forced_tool.empty()) {
+                    // tool_choice named a specific function — instruct the
+                    // model to call that exact tool, not merely "one of".
+                    tool_instr +=
+                        "\n\nIMPORTANT: You MUST call the tool \"" + forced_tool +
+                        "\" to answer this request — that exact tool, not any "
+                        "other.  Do not reply with plain text until you have "
+                        "called it and received its result.";
+                } else {
+                    tool_instr +=
+                        "\n\nIMPORTANT: You MUST call one of the above tools to "
+                        "answer this request.  Do not reply with plain text "
+                        "until after you have called a tool and received its "
+                        "result.";
+                }
             }
 
             // 3. Merge into the existing system message; never add a second one.
@@ -1121,7 +1399,7 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
             }
 
             // 4. Rebuild prompt and retokenize.
-            prompt      = apply_chat_template(messages, tmpl);
+            prompt      = render(messages);
             greq.tokens = engine_->tokenize(prompt);
             tool_schemas_were_injected = true;
             spdlog::debug("[OpenAI] chat  tool schemas injected  "
@@ -1168,7 +1446,7 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
 
             if (tool_schemas_were_injected) {
                 messages    = std::move(messages_pre_injection);
-                prompt      = apply_chat_template(messages, tmpl);
+                prompt      = render(messages);
                 greq.tokens = engine_->tokenize(prompt);
                 spdlog::info("[OpenAI] reverted tool-schema injection for "
                              "generator path (n_tokens now={})",
@@ -1335,10 +1613,22 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
                       "(client_requested_tools=true)");
     }
 
-    if (do_stream) {
+    // Tool calls are parsed from the *completed* model text (TrueLLM has no
+    // mid-stream tool grammar — see §12.7).  So when tools may be invoked we
+    // cannot live-stream: we buffer through the tool loop below and then replay
+    // the final answer as SSE.  Only token-stream live when no tools are in play.
+    const bool tools_in_play =
+        client_requested_tools || (plugin_bridge_ && plugin_bridge_->has_tools());
+
+    if (do_stream && !tools_in_play) {
         spdlog::debug("[OpenAI] chat stream starting  req_id={}", req_id);
+        const bool reasoning_on = reasoning_active();
+        // httplib's chunked-content provider stores the lambda in a copyable
+        // std::function, so the move-only ChatParser must travel via shared_ptr.
+        auto parser_ptr = std::make_shared<ChatParser>(std::move(rsp_parser));
         res.set_chunked_content_provider("text/event-stream",
-            [this, greq = std::move(greq), req_id, model_id]
+            [this, greq = std::move(greq), req_id, model_id,
+             parser_ptr, reasoning_on]
             (std::size_t /*offset*/, httplib::DataSink& sink) mutable -> bool
         {
             // Send role delta first
@@ -1355,26 +1645,15 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
             std::string first_msg = "data: " + first.dump() + "\n\n";
             sink.write(first_msg.data(), first_msg.size());
 
-            int n_tok = 0;
-            // Per-stream UTF-8 carry buffer: BPE pieces may split a multibyte
-            // character across two on_token calls.  We emit only bytes up to
-            // the last complete code point, and stash the trailing partial
-            // sequence for the next piece.
-            greq.on_token = [&, utf8_carry = std::string()](int32_t id,
-                                                            const std::string& piece) mutable {
-                ++n_tok;
-                spdlog::trace("[OpenAI] stream tok[{}] id={} piece={}", n_tok, id,
-                              piece.empty() ? "<empty>" : piece);
-                utf8_carry += piece;
-                std::string emit = sanitize_utf8(utf8_carry);
-                utf8_carry.erase(0, emit.size());
-                if (emit.empty()) return;   // waiting on more bytes
+            // Emit one chat.completion.chunk carrying a single delta key.
+            auto emit_delta = [&](const char* key, const std::string& value) {
+                if (value.empty()) return;
                 json chunk = {
                     {"id",      req_id},
                     {"object",  "chat.completion.chunk"},
                     {"model",   model_id},
                     {"choices", json::array({
-                        {{"delta",        {{"content", emit}}},
+                        {{"delta",        {{key, value}}},
                          {"index",        0},
                          {"finish_reason", nullptr}}
                     })}
@@ -1382,6 +1661,38 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
                 std::string msg = "data: " + chunk.dump() + "\n\n";
                 sink.write(msg.data(), msg.size());
             };
+
+            int n_tok = 0;
+            if (reasoning_on) {
+                // common_chat path: re-parse the full accumulated text each
+                // token and emit the incremental reasoning_content / content
+                // deltas the parser produces (handles <think>…</think> and the
+                // model's native reasoning markers).
+                greq.on_token = [&, accumulated = std::string()](int32_t id,
+                                                                 const std::string& piece) mutable {
+                    ++n_tok;
+                    spdlog::trace("[OpenAI] stream tok[{}] id={} piece={}", n_tok, id,
+                                  piece.empty() ? "<empty>" : piece);
+                    accumulated += piece;
+                    ChatStreamDelta d = parser_ptr->push(accumulated);
+                    emit_delta("reasoning_content", d.reasoning);
+                    emit_delta("content",           d.content);
+                };
+            } else {
+                // Legacy path: per-stream UTF-8 carry buffer.  BPE pieces may
+                // split a multibyte character across two on_token calls; emit
+                // only bytes up to the last complete code point.
+                greq.on_token = [&, utf8_carry = std::string()](int32_t id,
+                                                                const std::string& piece) mutable {
+                    ++n_tok;
+                    spdlog::trace("[OpenAI] stream tok[{}] id={} piece={}", n_tok, id,
+                                  piece.empty() ? "<empty>" : piece);
+                    utf8_carry += piece;
+                    std::string emit = sanitize_utf8(utf8_carry);
+                    utf8_carry.erase(0, emit.size());
+                    emit_delta("content", emit);
+                };
+            }
             auto result = engine_->generate(greq);
             sink.write("data: [DONE]\n\n", 14);
             sink.done();
@@ -1400,6 +1711,11 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
         const int kMaxToolRounds = cfg_.plugins.tool_max_rounds;
         int tool_round = 0;
         GenerateResult result;
+        json pending_tool_calls = json::array();  // §12.6 — client_tools
+        // Tool-use rounds are surfaced to the client as reasoning ("thinking
+        // stages"): the model's narration is kept, the raw tool-call JSON and
+        // tool results are hidden.  Only the final answer becomes content.
+        std::string reasoning_narrative;
 
         while (tool_round <= kMaxToolRounds) {
             result = engine_->generate(greq);
@@ -1417,14 +1733,55 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
                 return;
             }
 
-            // Only attempt tool dispatch if a plugin bridge is wired.
-            if (!plugin_bridge_ || !plugin_bridge_->has_tools()) break;
-
             auto tool_calls = parse_tool_calls(result.text);
             if (tool_calls.empty()) break;  // plain response — done
 
+            // §12.6 — Anthropic-style client tools: the caller (the
+            // AnthropicRouter, or any OpenAI client opting in) executes
+            // tools itself.  Return the calls instead of dispatching them.
+            // Checked before the plugin-bridge guard below so client-tool
+            // delegation works even on a server with no plugin tools.
+            if (client_tools) {
+                // Hand the calls back in OpenAI-canonical form (arguments as
+                // a JSON string), and drop the raw tool-call JSON from the
+                // assistant content when the whole turn was the call payload
+                // — otherwise it leaks back as a bogus text block.
+                pending_tool_calls   = canonical_tool_calls(tool_calls);
+                result.finish_reason = "tool_calls";
+                if (text_is_pure_tool_call(result.text))
+                    result.text.clear();
+                spdlog::debug("[OpenAI] chat client_tools — returning {} "
+                              "tool call(s) to caller", tool_calls.size());
+                break;
+            }
+
+            // Server-side dispatch requires a plugin bridge with tools.  Without
+            // one there is nothing to run the call against — stop and return
+            // whatever the model produced rather than looping uselessly.
+            if (!plugin_bridge_ || !plugin_bridge_->has_tools()) break;
+
             spdlog::debug("[OpenAI] chat tool_calls found  round={} n={}",
                           tool_round, tool_calls.size());
+
+            // Record this round as a thinking stage: the model's reasoning
+            // (<think>…</think>) plus its prose, with the tool-call JSON
+            // stripped.  The tool's name/args and raw result never reach the
+            // client — only the server owner sees those.
+            if (reasoning_active()) {
+                ChatParsedMessage rp = rsp_parser.finish(result.text);
+                std::string stage = rp.reasoning_content;
+                std::string prose = strip_tool_call_json(
+                    rp.content.empty() ? result.text : rp.content);
+                std::string chunk = stage;
+                if (!prose.empty()) {
+                    if (!chunk.empty()) chunk += "\n";
+                    chunk += prose;
+                }
+                if (!chunk.empty()) {
+                    if (!reasoning_narrative.empty()) reasoning_narrative += "\n\n";
+                    reasoning_narrative += chunk;
+                }
+            }
 
             // Append assistant turn.  Include result.text as "content" so that
             // apply_chat_template() can reconstruct the prompt faithfully — an
@@ -1580,7 +1937,7 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
             }
 
             // Rebuild prompt with full conversation and retokenize.
-            std::string updated = apply_chat_template(messages, tmpl);
+            std::string updated = render(messages);
             greq.tokens   = engine_->tokenize(updated);
             greq.on_token = nullptr;
 
@@ -1603,7 +1960,7 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
                             break;
                         }
                     }
-                    updated     = apply_chat_template(messages, tmpl);
+                    updated     = render(messages);
                     greq.tokens = engine_->tokenize(updated);
 
                     // Run the final inference and use its output as the answer.
@@ -1632,21 +1989,94 @@ void OpenAIRouter::handle_chat_completions(const httplib::Request& req,
             {"total_tokens",      result.prompt_tokens + result.generated_tokens}
         };
         merge_subcall_usage(usage, ctx.get());
-        json resp = {
-            {"id",      req_id},
-            {"object",  "chat.completion"},
-            {"created", unix_now()},
-            {"model",   model_id},
-            {"choices", json::array({
-                {{"message",      {{"role",    "assistant"},
-                                   {"content", sanitize_utf8(result.text)}}},
-                 {"index",        0},
-                 {"finish_reason", result.finish_reason.empty()
-                                      ? "stop" : result.finish_reason}}
-            })},
-            {"usage",   usage}
-        };
-        res.set_content(resp.dump(), "application/json");
+        // common_chat: split reasoning_content from the answer text.  When
+        // reasoning is inactive (or formatter unavailable) the text passes
+        // through unchanged.
+        std::string answer_text = result.text;
+        std::string reasoning_text;
+        if (reasoning_active() && !result.text.empty()) {
+            ChatParsedMessage parsed = rsp_parser.finish(result.text);
+            answer_text    = parsed.content;
+            reasoning_text = parsed.reasoning_content;
+        }
+        // Safety net: if the tool loop exhausted tool_max_rounds while the model
+        // was still emitting a tool call (common on long research turns), the
+        // last round's {"tool_calls":…} JSON would otherwise leak into the
+        // answer.  Strip it so the client never sees raw tool calls.
+        answer_text = strip_tool_call_json(answer_text);
+        // Prepend the tool-use thinking stages so the client sees the whole
+        // chain of thought (search → read → synthesize) as reasoning, with the
+        // final synthesized answer as content.
+        if (!reasoning_narrative.empty()) {
+            reasoning_text = reasoning_text.empty()
+                ? reasoning_narrative
+                : reasoning_narrative + "\n\n" + reasoning_text;
+        }
+        // §12.6 — when client_tools returned pending calls, surface them
+        // on the assistant message so the caller can execute them.
+        json assistant_msg = {{"role",    "assistant"},
+                              {"content", sanitize_utf8(answer_text)}};
+        if (!reasoning_text.empty())
+            assistant_msg["reasoning_content"] = sanitize_utf8(reasoning_text);
+        if (!pending_tool_calls.empty())
+            assistant_msg["tool_calls"] = pending_tool_calls;
+
+        const std::string finish_reason =
+            result.finish_reason.empty() ? "stop" : result.finish_reason;
+
+        if (do_stream) {
+            // Buffered-streaming replay (tools were in play, so we could not
+            // live-stream).  Emit the finished answer as a proper SSE sequence:
+            // role delta → reasoning_content delta → content delta → tool_call
+            // deltas → finish chunk → [DONE].  The client reassembles exactly
+            // as it would a live stream.
+            spdlog::debug("[OpenAI] chat buffered-stream replay  req_id={}", req_id);
+            res.set_chunked_content_provider("text/event-stream",
+                [req_id, model_id, assistant_msg, finish_reason, completed = false]
+                (std::size_t, httplib::DataSink& sink) mutable -> bool
+            {
+                if (completed) return false;
+                completed = true;
+                auto send = [&](const json& delta, const json& fr) {
+                    json chunk = {
+                        {"id",      req_id},
+                        {"object",  "chat.completion.chunk"},
+                        {"model",   model_id},
+                        {"choices", json::array({
+                            {{"delta", delta}, {"index", 0}, {"finish_reason", fr}}
+                        })}
+                    };
+                    std::string m = "data: " + chunk.dump() + "\n\n";
+                    sink.write(m.data(), m.size());
+                };
+                send({{"role", "assistant"}}, nullptr);
+                if (assistant_msg.contains("reasoning_content"))
+                    send({{"reasoning_content", assistant_msg["reasoning_content"]}}, nullptr);
+                if (assistant_msg.contains("content")
+                    && !assistant_msg["content"].get<std::string>().empty())
+                    send({{"content", assistant_msg["content"]}}, nullptr);
+                if (assistant_msg.contains("tool_calls"))
+                    send({{"tool_calls", assistant_msg["tool_calls"]}}, nullptr);
+                send(json::object(), finish_reason);
+                sink.write("data: [DONE]\n\n", 14);
+                sink.done();
+                return true;
+            });
+        } else {
+            json resp = {
+                {"id",      req_id},
+                {"object",  "chat.completion"},
+                {"created", unix_now()},
+                {"model",   model_id},
+                {"choices", json::array({
+                    {{"message",      assistant_msg},
+                     {"index",        0},
+                     {"finish_reason", finish_reason}}
+                })},
+                {"usage",   usage}
+            };
+            res.set_content(resp.dump(), "application/json");
+        }
     }
     } catch (const std::exception& ex) {
         spdlog::error("[OpenAI] /v1/chat/completions — unhandled exception: {}", ex.what());

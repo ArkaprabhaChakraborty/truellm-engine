@@ -253,6 +253,14 @@ void parse_inference(const toml::value& root, InferenceConfig& out)
                          rlm.max_hierarchy_depth);
         }
     }
+
+    // [inference.reasoning] — thinking/reasoning_content separation.
+    if (t.contains("reasoning")) {
+        const auto& r = toml::find(t, "reasoning");
+        auto& rs = out.reasoning;
+        rs.format          = toml::find_or<std::string>(r, "format",          rs.format);
+        rs.enable_thinking = toml::find_or<bool>       (r, "enable_thinking", rs.enable_thinking);
+    }
 }
 
 // Parse [sampling]

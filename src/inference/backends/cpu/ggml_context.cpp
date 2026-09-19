@@ -107,29 +107,21 @@ void GgmlContext::reset()
     if (ctx_) llama_memory_clear(llama_get_memory(ctx_), false);
 }
 
-void GgmlContext::build_sampler(GgmlModel& model)
+void GgmlContext::add_standard_samplers(llama_sampler* chain) const
 {
-    if (sampler_) {
-        llama_sampler_free(sampler_);
-        sampler_ = nullptr;
-    }
-
-    llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
-    sampler_ = llama_sampler_chain_init(chain_params);
-
-    llama_sampler_chain_add(sampler_,
+    llama_sampler_chain_add(chain,
         llama_sampler_init_top_k(smp_cfg_.top_k));
 
-    llama_sampler_chain_add(sampler_,
+    llama_sampler_chain_add(chain,
         llama_sampler_init_top_p(smp_cfg_.top_p, /*min_keep=*/1));
 
-    llama_sampler_chain_add(sampler_,
+    llama_sampler_chain_add(chain,
         llama_sampler_init_min_p(smp_cfg_.min_p, /*min_keep=*/1));
 
-    llama_sampler_chain_add(sampler_,
+    llama_sampler_chain_add(chain,
         llama_sampler_init_temp(smp_cfg_.temperature));
 
-    llama_sampler_chain_add(sampler_,
+    llama_sampler_chain_add(chain,
         llama_sampler_init_penalties(
             64,   // penalty_last_n: last 64 tokens
             smp_cfg_.repeat_penalty,
@@ -142,9 +134,45 @@ void GgmlContext::build_sampler(GgmlModel& model)
                         .time_since_epoch().count() & 0xFFFFFFFF)
                   : static_cast<uint32_t>(smp_cfg_.seed);
 
-    llama_sampler_chain_add(sampler_, llama_sampler_init_dist(seed));
+    llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+}
+
+void GgmlContext::build_sampler(GgmlModel& model)
+{
+    if (sampler_) {
+        llama_sampler_free(sampler_);
+        sampler_ = nullptr;
+    }
+
+    llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+    sampler_ = llama_sampler_chain_init(chain_params);
+    add_standard_samplers(sampler_);
 
     (void)model; // reserved for future vocab-dependent samplers
+}
+
+llama_sampler* GgmlContext::make_grammar_sampler(GgmlModel& model,
+                                                 const std::string& grammar) const
+{
+    if (grammar.empty()) return nullptr;
+    const llama_vocab* vocab = model.vocab();
+    if (!vocab) return nullptr;
+
+    // Parse the GBNF first so a malformed grammar degrades to unconstrained
+    // sampling instead of aborting the request.
+    llama_sampler* gr = llama_sampler_init_grammar(vocab, grammar.c_str(), "root");
+    if (!gr) {
+        spdlog::warn("[GgmlContext] grammar failed to parse — decoding unconstrained");
+        return nullptr;
+    }
+
+    llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+    llama_sampler* chain = llama_sampler_chain_init(chain_params);
+    // Grammar constraint is applied first (masks disallowed tokens), then the
+    // usual top_k/top_p/temp/penalties/dist pick among the allowed set.
+    llama_sampler_chain_add(chain, gr);
+    add_standard_samplers(chain);
+    return chain;
 }
 
 } // namespace truellm

@@ -183,6 +183,22 @@ struct BatchingConfig {
     bool kv_unified    = true;
 };
 
+// ─── [inference.reasoning] ────────────────────────────────────────────────────
+// Controls reasoning ("thinking") separation via the common_chat layer
+// (src/server/chat_format.*).  When a reasoning model emits <think>…</think>
+// (or harmony channels), the server splits the thinking text into a separate
+// `reasoning_content` field — streamed as `delta.reasoning_content` (OpenAI)
+// and `thinking` blocks (Anthropic) — instead of inlining it in the answer.
+struct ReasoningConfig {
+    // "auto"   — extract thinking into reasoning_content (== deepseek).  Default.
+    // "deepseek" — same, explicit.
+    // "none"   — no separation; thinking stays inline in content (legacy behaviour).
+    std::string format          = "auto";
+    // When false, suppress reasoning entirely where the chat template supports
+    // a thinking on/off switch (e.g. Qwen3 /no_think).
+    bool        enable_thinking = true;
+};
+
 // ─── [inference] ─────────────────────────────────────────────────────────────
 struct InferenceConfig {
     std::string       backend         = "cpu";        // "cpu" | "cuda"
@@ -200,6 +216,7 @@ struct InferenceConfig {
     BatchingConfig      batching;
     CompressionConfig   compression;
     RlmConfig           rlm;
+    ReasoningConfig     reasoning;
 };
 
 // ─── [sampling] ──────────────────────────────────────────────────────────────

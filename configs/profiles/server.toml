@@ -36,6 +36,14 @@ flash_attention = true
 mmap            = true
 mlock           = true    # prevent swap on production
 
+[inference.reasoning]
+# Separate reasoning ("thinking") from the answer for reasoning models
+# (DeepSeek-R1, Qwen3, QwQ, gpt-oss).  Surfaced as `reasoning_content` on
+# OpenAI responses/streams and `thinking` blocks on the Anthropic API.
+#   format = "auto" | "deepseek" | "none"   ("none" keeps thinking inline)
+format          = "auto"
+enable_thinking = true
+
 [inference.kv_cache]
 type_k = "f16"
 type_v = "f16"

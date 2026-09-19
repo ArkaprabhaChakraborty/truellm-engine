@@ -6,6 +6,7 @@
 #include <truellm/config_schema.h>
 #include "openai_router.h"
 #include "native_router.h"
+#include "anthropic_router.h"
 #include "middleware/auth_middleware.h"
 #include "middleware/logging_middleware.h"
 
@@ -39,8 +40,11 @@ private:
     httplib::Server      svr_;
 
     // Routers must outlive the route lambdas they register — keep them as members.
-    OpenAIRouter openai_router_;
-    NativeRouter native_router_;
+    // Declaration order matters: anthropic_router_ holds &openai_router_, so
+    // openai_router_ must be constructed first.
+    OpenAIRouter    openai_router_;
+    NativeRouter    native_router_;
+    AnthropicRouter anthropic_router_;
 
     // Per-IP rate limiter; constructed from hardware.guardrails.preset.
     std::unique_ptr<policy::RateLimiter> rate_limiter_;
